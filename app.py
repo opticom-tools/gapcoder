@@ -1,15 +1,14 @@
 # -------------------------------------------------------------
-# GapCoder v1.2 — GAP Analysis Summariser (Importance / Client / Competitor + Comments)
+# GapCoder v1.3 — GAP Analysis Summariser (Importance / Client / Competitor + Comments)
 #
-# UPDATED COLUMN FORMAT (primary):
+# Primary column format:
 #   gap_imp_1, gap_perf_1, gap_comp_1, gap_comm_1
-#
-# Also supports old format (fallback):
+# Backward compatible:
 #   gap1_imp, gap1_perf, gap1_comp, gap1_comm
 #
-# Input:
-# - Paste respondent-level table copied from Excel incl. headers (TSV) or CSV
-# - Optional RESP_ID column
+# Input methods:
+# - Upload .xlsx (recommended when comments are long / may contain line breaks)
+# - Paste TSV/CSV copied from Excel
 #
 # Gap Dictionary (required):
 #   1 = Section | Gap name
@@ -18,8 +17,8 @@
 # - 999 = don't know  -> treated as missing
 # - 0   = no answer   -> treated as missing
 # - blank = missing
-# - If competitor missing but imp/perf exist -> "competitor refused"
-# - If imp+perf+comp all missing -> "not asked to respondent"
+# - If competitor missing but imp/perf exist -> "competitor refused" (row-level signal)
+# - If imp+perf+comp all missing -> "not asked to respondent" (row-level signal)
 # -------------------------------------------------------------
 
 import streamlit as st
@@ -27,9 +26,16 @@ import os
 import json
 import re
 import csv
-from io import StringIO
+from io import StringIO, BytesIO
 from datetime import datetime
 from anthropic import Anthropic
+
+try:
+    from openpyxl import load_workbook
+    XLSX_OK = True
+except Exception:
+    XLSX_OK = False
+
 
 # --------------------
 # Config
@@ -45,6 +51,8 @@ GAP_COL_RE_NEW = re.compile(r"^gap_(imp|perf|comp|comm)_(\d+)$", re.IGNORECASE)
 GAP_COL_RE_OLD = re.compile(r"^gap(\d+)_(imp|perf|comp|comm)$", re.IGNORECASE)
 
 RESP_ID_CANDIDATES = {"resp_id", "respondent_id", "respondent", "resp", "id"}
+ID_LIKE_RE = re.compile(r"^[A-Za-z]{2,}\d+.*$")  # e.g. UPM001, RESP_001, etc.
+
 
 # --------------------
 # Project persistence
@@ -59,74 +67,143 @@ def save_projects(path: str, data: dict) -> None:
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
+
 # --------------------
 # Parsing helpers
 # --------------------
-def detect_delimiter(text: str) -> str:
-    if "\t" in text.splitlines()[0]:
+def detect_delimiter_from_header(header_line: str) -> str:
+    # Best-effort, keeps it simple
+    if "\t" in header_line:
         return "\t"
-    sample = "\n".join(text.splitlines()[:10])
-    try:
-        dialect = csv.Sniffer().sniff(sample, delimiters=",;\t")
-        return dialect.delimiter
-    except:
-        return ","
+    if ";" in header_line and "," not in header_line:
+        return ";"
+    return ","
 
-def parse_table(text: str):
-    if not text.strip():
+def normalise_headers(fieldnames):
+    """Replace empty headers with COL_1, COL_2 etc., and make them unique."""
+    seen = set()
+    out = []
+    for idx, h in enumerate(fieldnames):
+        name = "" if h is None else str(h).strip()
+        if name == "":
+            name = f"COL_{idx+1}"
+        base = name
+        i = 2
+        while name in seen:
+            name = f"{base}_{i}"
+            i += 1
+        seen.add(name)
+        out.append(name)
+    return out
+
+def parse_table_paste(text: str):
+    if not text or not text.strip():
         raise ValueError("No data pasted.")
 
-    delim = detect_delimiter(text.strip())
-    f = StringIO(text.strip())
-    reader = csv.DictReader(f, delimiter=delim)
+    # Remove fully empty lines (common when pasting)
+    lines = [ln for ln in text.splitlines() if ln.strip() != ""]
+    if len(lines) < 2:
+        raise ValueError(
+            "It looks like you only pasted one line (likely just the header, or header+values without row breaks). "
+            "Try copying the full Excel table again, or use the .xlsx upload option."
+        )
 
-    if not reader.fieldnames:
-        raise ValueError("Could not read header row. Make sure you pasted the header line too.")
+    delim = detect_delimiter_from_header(lines[0])
+    cleaned_text = "\n".join(lines)
+    f = StringIO(cleaned_text)
+    reader = csv.reader(f, delimiter=delim)
 
-    headers = [h.strip() for h in reader.fieldnames if h]
+    raw_fieldnames = next(reader, None)
+    if not raw_fieldnames:
+        raise ValueError("Could not read header row. Make sure the first line is the header.")
+
+    headers = normalise_headers(raw_fieldnames)
+
     rows = []
-    for r in reader:
+    for row in reader:
+        # Skip completely empty rows
+        if not any(str(v).strip() for v in row if v is not None):
+            continue
+        # Pad / trim to header length
+        if len(row) < len(headers):
+            row = row + [""] * (len(headers) - len(row))
+        if len(row) > len(headers):
+            row = row[:len(headers)]
+        rows.append({headers[i]: ("" if row[i] is None else str(row[i]).strip()) for i in range(len(headers))})
+
+    if not rows:
+        raise ValueError(
+            "No rows found under the header. This often happens when Excel comments contain hidden line breaks, "
+            "or the paste didn't include any respondent rows. Recommendation: upload the .xlsx instead."
+        )
+
+    return headers, rows
+
+def parse_table_xlsx(uploaded_file):
+    if not XLSX_OK:
+        raise ValueError("openpyxl is not available. Add 'openpyxl' to requirements.txt.")
+
+    data = uploaded_file.getvalue()
+    wb = load_workbook(BytesIO(data), data_only=True)
+    ws = wb.active
+
+    # Read header row (row 1)
+    raw_headers = [cell.value for cell in next(ws.iter_rows(min_row=1, max_row=1))]
+    if not raw_headers or all(h is None or str(h).strip() == "" for h in raw_headers):
+        raise ValueError("The first row in the Excel file is empty. Please ensure row 1 contains headers.")
+
+    headers = normalise_headers(raw_headers)
+
+    rows = []
+    for r in ws.iter_rows(min_row=2, values_only=True):
+        if r is None:
+            continue
+        if not any(v is not None and str(v).strip() != "" for v in r):
+            continue
+        row = list(r)
+        if len(row) < len(headers):
+            row = row + [""] * (len(headers) - len(row))
+        if len(row) > len(headers):
+            row = row[:len(headers)]
+
         cleaned = {}
-        for k, v in r.items():
-            if k is None:
-                continue
-            kk = k.strip()
-            vv = v.strip() if isinstance(v, str) else v
-            cleaned[kk] = vv
+        for i, h in enumerate(headers):
+            v = row[i]
+            if v is None:
+                cleaned[h] = ""
+            else:
+                cleaned[h] = str(v).strip() if not isinstance(v, (int, float)) else v
         rows.append(cleaned)
 
     if not rows:
-        raise ValueError("No rows found under the header.")
+        raise ValueError("No data rows found under the header in the Excel file.")
     return headers, rows
 
 def parse_score(value):
     if value is None:
         return None, "blank"
-    s = str(value).strip()
-    if s == "":
-        return None, "blank"
 
-    try:
-        num = float(s.replace(",", "."))
-    except:
-        return None, "blank"
+    # Keep numeric as-is when coming from xlsx
+    if isinstance(value, (int, float)):
+        num = float(value)
+    else:
+        s = str(value).strip()
+        if s == "":
+            return None, "blank"
+        try:
+            num = float(s.replace(",", "."))
+        except:
+            return None, "blank"
 
     if abs(num - 0.0) < 1e-12:
         return None, "no_answer_0"
     if abs(num - 999.0) < 1e-12:
         return None, "dont_know_999"
-
     return num, None
-
-def detect_resp_id_col(headers):
-    for h in headers:
-        if h.strip().lower() in RESP_ID_CANDIDATES:
-            return h
-    return None
 
 def parse_gap_dictionary(text: str):
     """
-    Expected line format:
+    Expected:
       12 = Section Name | Criterion Name
     Also accepts ":" instead of "=".
     """
@@ -164,6 +241,62 @@ def parse_gap_dictionary(text: str):
 
     return mapping
 
+def build_gap_schema(headers):
+    """
+    Returns:
+      gaps: sorted list of gap numbers
+      col_map: dict[(gap_no, suffix)] -> header
+    suffix: imp, perf, comp, comm
+    """
+    col_map = {}
+    gap_nums = set()
+
+    for h in headers:
+        hh = str(h).strip()
+
+        m_new = GAP_COL_RE_NEW.match(hh)
+        if m_new:
+            suffix = m_new.group(1).lower()
+            n = int(m_new.group(2))
+            col_map[(n, suffix)] = h
+            gap_nums.add(n)
+            continue
+
+        m_old = GAP_COL_RE_OLD.match(hh)
+        if m_old:
+            n = int(m_old.group(1))
+            suffix = m_old.group(2).lower()
+            col_map.setdefault((n, suffix), h)
+            gap_nums.add(n)
+
+    return sorted(gap_nums), col_map
+
+def detect_resp_id_col(headers, rows):
+    # 1) by name
+    for h in headers:
+        if str(h).strip().lower() in RESP_ID_CANDIDATES:
+            return h
+
+    # 2) heuristic: look for a column that is mostly "id-like"
+    best = None
+    best_score = 0.0
+    for h in headers:
+        vals = []
+        for r in rows[:50]:
+            vals.append(r.get(h, ""))
+        nonempty = [v for v in vals if str(v).strip() != ""]
+        if len(nonempty) < 5:
+            continue
+        idlike = sum(1 for v in nonempty if ID_LIKE_RE.match(str(v).strip()))
+        score = idlike / max(1, len(nonempty))
+        if score > best_score:
+            best_score = score
+            best = h
+
+    if best_score >= 0.6:
+        return best
+    return None
+
 def mean(vals):
     vv = [v for v in vals if v is not None]
     if not vv:
@@ -179,65 +312,34 @@ def classify_vs_comp(gap):
         return "lagging"
     return "same"
 
-def build_gap_schema(headers):
+def compute_criterion_table(rows, gaps, col_map, resp_id_col, gap_dict):
     """
     Returns:
-      gaps: sorted list of gap numbers
-      col_map: dict[(gap_no, suffix)] -> actual_header
-    suffix in: imp, perf, comp, comm
-    Supports BOTH formats:
-      gap_imp_1 (preferred)
-      gap1_imp  (fallback)
+      criterion_table: list[dict]
+      comments_by_gap: dict gap_no -> list of {"resp_id","comment"} (truncated)
+      data_quality: dict
     """
-    col_map = {}
-    gap_nums = set()
-
-    for h in headers:
-        hh = h.strip()
-
-        m_new = GAP_COL_RE_NEW.match(hh)
-        if m_new:
-            suffix = m_new.group(1).lower()
-            n = int(m_new.group(2))
-            col_map[(n, suffix)] = h
-            gap_nums.add(n)
-            continue
-
-        m_old = GAP_COL_RE_OLD.match(hh)
-        if m_old:
-            n = int(m_old.group(1))
-            suffix = m_old.group(2).lower()
-            # only set if not already set by new format
-            col_map.setdefault((n, suffix), h)
-            gap_nums.add(n)
-
-    return sorted(gap_nums), col_map
-
-# --------------------
-# Computation
-# --------------------
-def compute_criterion_table(rows, gaps, col_map, resp_id_col, gap_dict):
     criterion_table = []
-    comment_samples = {}
+    comments_by_gap = {}
     data_quality = {"note": "0, 999 and blanks treated as missing and ignored in means."}
 
-    # Comment sampling (keep prompt compact)
+    # Collect comments by gap (we'll later sample only the important ones)
     for n in gaps:
         comm_col = col_map.get((n, "comm"))
         if not comm_col:
             continue
-        samples = []
+        bucket = []
         for i, r in enumerate(rows, start=1):
             resp_id = (r.get(resp_id_col) if resp_id_col else None) or f"RESP_{i:03d}"
-            c = (r.get(comm_col, "") or "").strip()
+            c = r.get(comm_col, "")
+            c = c if c is not None else ""
+            c = str(c).strip()
             if c:
-                if len(c) > 240:
-                    c = c[:240].rstrip() + "…"
-                samples.append({"resp_id": resp_id, "comment": c})
-            if len(samples) >= 25:
-                break
-        if samples:
-            comment_samples[n] = samples
+                if len(c) > 280:
+                    c = c[:280].rstrip() + "…"
+                bucket.append({"resp_id": str(resp_id).strip(), "comment": c})
+        if bucket:
+            comments_by_gap[n] = bucket
 
     for n in gaps:
         imp_col = col_map.get((n, "imp"))
@@ -312,7 +414,7 @@ def compute_criterion_table(rows, gaps, col_map, resp_id_col, gap_dict):
             "missing_counts": missing_counts,
         })
 
-    return criterion_table, comment_samples, data_quality
+    return criterion_table, comments_by_gap, data_quality
 
 def summarise(criteria_rows):
     total = len(criteria_rows)
@@ -370,6 +472,34 @@ def summarise(criteria_rows):
         }
     }
 
+def pick_comment_samples(criteria_table, comments_by_gap, max_gaps=12, per_gap=6):
+    """
+    Keep prompt small:
+    - focus on biggest gaps vs expectations + most lagging vs competitor
+    - sample a few comments per priority gap
+    """
+    eval_expect = [r for r in criteria_table if r["mean_gap_vs_expectations"] is not None]
+    eval_comp = [r for r in criteria_table if r["mean_gap_vs_competitor"] is not None]
+
+    top_expect = sorted(eval_expect, key=lambda r: r["mean_gap_vs_expectations"], reverse=True)[:6]
+    top_lag = sorted(eval_comp, key=lambda r: r["mean_gap_vs_competitor"])[:6]
+
+    priority = []
+    seen = set()
+    for r in top_expect + top_lag:
+        n = r["gap_no"]
+        if n not in seen:
+            priority.append(n)
+            seen.add(n)
+    priority = priority[:max_gaps]
+
+    out = {}
+    for n in priority:
+        bucket = comments_by_gap.get(n, [])
+        if bucket:
+            out[n] = bucket[:per_gap]
+    return out
+
 def build_claude_prompt(ctx, criteria_table, overall_stats, section_stats, comment_samples, data_quality):
     json_template = {
         "total_gap_overview": {"slide_bullets": ["..."], "narrative": "..."},
@@ -413,7 +543,20 @@ COMMENT SAMPLES (use for improvement suggestions; cite gap/section where possibl
 
 WHAT TO PRODUCE:
 1) Total GAP overview (200–400 words narrative + slide bullets)
+   Include:
+   - how many criteria in total
+   - high-level remark
+   - how many leading/same/lagging vs competition (where evaluable)
+   - top 3 leading vs competition + biggest gaps vs competition
+   - biggest gaps vs expectations
+   - main improvement suggestions from customers (from comments)
 2) Key findings per section (200–300 words each + slide bullets)
+   Cover:
+   - expectations met in general
+   - top gaps vs expectations
+   - performance vs competition
+   - top gaps vs competition / where lagging
+   - improvement suggestions from comments
 
 OUTPUT FORMAT:
 Return JSON matching this template exactly:
@@ -421,11 +564,12 @@ Return JSON matching this template exactly:
 """
     return prompt.strip()
 
+
 # --------------------
 # Streamlit UI
 # --------------------
 st.set_page_config(page_title="GapCoder", layout="wide")
-st.markdown(f"# 📊 GapCoder (v1.2)\n_Last updated: {datetime.now():%Y-%m-%d}_")
+st.markdown(f"# 📊 GapCoder (v1.3)\n_Last updated: {datetime.now():%Y-%m-%d}_")
 
 projects = load_projects(PROJECTS_FILE)
 client = Anthropic(api_key=st.secrets.get("ANTHROPIC_API_KEY", ""))
@@ -463,33 +607,61 @@ with st.expander("1. Project Context", expanded=True):
         projects[project_no] = ctx
         save_projects(PROJECTS_FILE, projects)
 
-with st.expander("2. Paste GAP Data (copy from Excel)", expanded=True):
+    # Small sanity feedback for dictionary
+    gd = parse_gap_dictionary(gap_dict_raw)
+    if gd:
+        secs = sorted({v["section"] for v in gd.values()})
+        st.info(f"✅ Gap Dictionary loaded: {len(gd)} gaps mapped across {len(secs)} sections.")
+    else:
+        st.warning("Gap Dictionary is required before running the analysis.")
+
+with st.expander("2. Input data (simple)", expanded=True):
     st.markdown(
-        "Paste your raw respondent-level table **including headers**.\n\n"
-        "**Primary expected columns:** `gap_imp_1`, `gap_perf_1`, `gap_comp_1`, `gap_comm_1`.\n"
-        "Recommended: `RESP_ID` as first column.\n\n"
-        "**Missing rules:** blank / `0` / `999` are treated as missing and ignored in means."
+        "**Recommended:** Upload the Excel file (.xlsx). This avoids copy-paste issues when comments contain line breaks.\n\n"
+        "Supported headers:\n"
+        "- `gap_imp_1`, `gap_perf_1`, `gap_comp_1`, `gap_comm_1` (primary)\n"
+        "- `gap1_imp` etc. (fallback)\n\n"
+        "Missing rules: blank / `0` / `999` are treated as missing and ignored in means."
     )
-    st.code(
-        "RESP_ID\tgap_imp_1\tgap_perf_1\tgap_comp_1\tgap_comm_1\n"
-        "RESP_001\t9\t6\t8\tOften too slow on urgent orders\n"
-        "RESP_002\t8\t7\t\tRefused competitor rating\n",
-        language="text"
-    )
-    raw = st.text_area("Paste table here", height=260, key="raw_gap")
+
+    input_mode = st.radio("How do you want to provide data?", ["Upload Excel (.xlsx)", "Paste table (TSV/CSV)"], index=0)
+
+    uploaded = None
+    raw_text = ""
+
+    if input_mode == "Upload Excel (.xlsx)":
+        if not XLSX_OK:
+            st.error("Excel upload needs openpyxl. Add it to requirements.txt and redeploy.")
+        uploaded = st.file_uploader("Upload .xlsx", type=["xlsx"])
+        st.caption("Tip: make sure row 1 contains headers and each following row is one respondent.")
+    else:
+        st.code(
+            "ID\tgap_imp_1\tgap_perf_1\tgap_comp_1\tgap_comm_1\n"
+            "UPM001\t7\t8\t7\t(optional comment)\n"
+            "UPM002\t9\t9\t\tRefused competitor rating\n",
+            language="text"
+        )
+        raw_text = st.text_area("Paste table here", height=260, key="raw_gap")
 
 if st.button("🧠 Generate GAP Analysis"):
     if not ctx.get("gap_dict_raw", "").strip():
         st.error("Please fill in the Gap Dictionary first (gap number = Section | Gap name).")
         st.stop()
-    if not raw.strip():
-        st.error("Paste your GAP table first.")
-        st.stop()
 
     gap_dict = parse_gap_dictionary(ctx["gap_dict_raw"])
 
+    # Parse data
     try:
-        headers, rows = parse_table(raw)
+        if input_mode == "Upload Excel (.xlsx)":
+            if uploaded is None:
+                st.error("Please upload an .xlsx file first.")
+                st.stop()
+            headers, rows = parse_table_xlsx(uploaded)
+        else:
+            if not raw_text.strip():
+                st.error("Paste your GAP table first (header + rows).")
+                st.stop()
+            headers, rows = parse_table_paste(raw_text)
     except ValueError as e:
         st.error(str(e))
         st.stop()
@@ -499,24 +671,27 @@ if st.button("🧠 Generate GAP Analysis"):
         st.error("Could not find any gap columns. Expected headers like gap_imp_1 / gap_perf_1 / gap_comp_1 / gap_comm_1.")
         st.stop()
 
-    resp_id_col = detect_resp_id_col(headers)
-
     # Ensure dictionary covers all gaps found
     missing_in_dict = [n for n in gaps if n not in gap_dict]
     if missing_in_dict:
         st.error(f"Gap Dictionary is missing these gap numbers: {missing_in_dict}. Please add them.")
         st.stop()
 
-    # One section mode: choose from dictionary sections
+    resp_id_col = detect_resp_id_col(headers, rows)
+    if resp_id_col is None:
+        st.warning("No RESP_ID/ID column detected. I will label rows as RESP_001, RESP_002, ...")
+
+    # Optional: choose a section before running
+    selected_section = None
     if ctx.get("mode") == "One section":
         all_sections = sorted({gap_dict[n]["section"] for n in gaps})
-        chosen_section = st.selectbox("Choose section to analyse", all_sections, index=0)
-        gaps = [n for n in gaps if gap_dict[n]["section"] == chosen_section]
+        selected_section = st.selectbox("Choose section to analyse", all_sections, index=0)
+        gaps = [n for n in gaps if gap_dict[n]["section"] == selected_section]
         if not gaps:
             st.error("No gaps found for selected section.")
             st.stop()
 
-    criterion_table, comment_samples, data_quality = compute_criterion_table(
+    criterion_table, comments_by_gap, data_quality = compute_criterion_table(
         rows=rows,
         gaps=gaps,
         col_map=col_map,
@@ -530,6 +705,8 @@ if st.button("🧠 Generate GAP Analysis"):
     for r in criterion_table:
         grouped.setdefault(r["section"], []).append(r)
     section_stats = {sec: summarise(items) for sec, items in grouped.items()}
+
+    comment_samples = pick_comment_samples(criterion_table, comments_by_gap, max_gaps=12, per_gap=6)
 
     st.subheader("Quick sanity check (computed from your data)")
     st.write(overall_stats)
@@ -570,7 +747,7 @@ if st.button("🧠 Generate GAP Analysis"):
             st.info("No section outputs returned.")
         else:
             names = [s.get("section", "Unnamed") for s in sections_out]
-            pick = st.selectbox("Choose section:", names, index=0)
+            pick = st.selectbox("Choose section output:", names, index=0)
             chosen = next((s for s in sections_out if s.get("section") == pick), sections_out[0])
 
             st.markdown("### Slide bullets")
@@ -592,3 +769,11 @@ if st.button("🧠 Generate GAP Analysis"):
             combined.append("BULLETS:\n" + "\n".join(s.get("slide_bullets", [])) + "\n")
             combined.append("NARRATIVE:\n" + s.get("narrative", "") + "\n\n")
         st.text_area("Sections (copy)", "\n".join(combined), height=320)
+
+# Sidebar context
+st.sidebar.header("Project Context")
+for k, v in ctx.items():
+    if k.endswith("_raw"):
+        st.sidebar.markdown(f"**{k.replace('_',' ').title()}:** (configured)")
+    else:
+        st.sidebar.markdown(f"**{k.replace('_',' ').title()}:** {v}")
