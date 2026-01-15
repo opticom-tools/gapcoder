@@ -1,4 +1,3 @@
-```python
 # -------------------------------------------------------------
 # GapCoder v1.5 — GAP Analysis Summariser (Importance / Client / Competitor + Comments)
 # Last updated: 2026-01-15
