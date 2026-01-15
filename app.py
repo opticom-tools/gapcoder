@@ -1,5 +1,5 @@
 # -------------------------------------------------------------
-# GapCoder v1.6 — GAP Analysis Summariser (Importance / Client / Competitor + Comments)
+# GapCoder v1.6.1 — GAP Analysis Summariser (Importance / Client / Competitor + Comments)
 # Last updated: 2026-01-15
 #
 # Supported headers (ONLY; no fallback):
@@ -65,7 +65,7 @@ except Exception:
 # Config
 # --------------------
 CLAUDE_MODEL = "claude-sonnet-4-5"
-MAX_CLAUDE_TOKENS = 4200  # increased: section narratives can be long
+MAX_CLAUDE_TOKENS = 4200  # section narratives can be long
 PROJECTS_FILE = "gapcoder_projects.json"
 
 # threshold for competitive position buckets (Client - Competitor)
@@ -419,9 +419,16 @@ def compute_tables(rows, gaps, col_map, resp_id_col, gap_dict):
     return criterion_table, comments_by_gap
 
 def summarise(criteria_rows):
+    """
+    Expects rows with:
+      mean_gap_vs_competitor_client_minus_competitor
+      mean_gap_vs_expectations_importance_minus_client
+      mean_importance / mean_client / mean_competitor
+    """
     total = len(criteria_rows)
-    eval_comp = [r for r in criteria_rows if r["mean_gap_vs_competitor_client_minus_competitor"] is not None]
-    eval_expect = [r for r in criteria_rows if r["mean_gap_vs_expectations_importance_minus_client"] is not None]
+
+    eval_comp = [r for r in criteria_rows if r.get("mean_gap_vs_competitor_client_minus_competitor") is not None]
+    eval_expect = [r for r in criteria_rows if r.get("mean_gap_vs_expectations_importance_minus_client") is not None]
 
     pos_counts = {"Competitive advantages": 0, "Similar to competition": 0, "Behind competition": 0}
     for r in eval_comp:
@@ -433,11 +440,11 @@ def summarise(criteria_rows):
     top_beh = sorted(eval_comp, key=lambda r: r["mean_gap_vs_competitor_client_minus_competitor"])[:3]
     top_expect = sorted(eval_expect, key=lambda r: r["mean_gap_vs_expectations_importance_minus_client"], reverse=True)[:3]
 
-    avg_imp = mean([r["mean_importance"] for r in criteria_rows])
-    avg_cli = mean([r["mean_client"] for r in criteria_rows])
-    avg_com = mean([r["mean_competitor"] for r in criteria_rows])
-    avg_gap_comp = mean([r["mean_gap_vs_competitor_client_minus_competitor"] for r in eval_comp])
-    avg_gap_expect = mean([r["mean_gap_vs_expectations_importance_minus_client"] for r in eval_expect])
+    avg_imp = mean([r.get("mean_importance") for r in criteria_rows])
+    avg_cli = mean([r.get("mean_client") for r in criteria_rows])
+    avg_com = mean([r.get("mean_competitor") for r in criteria_rows])
+    avg_gap_comp = mean([r.get("mean_gap_vs_competitor_client_minus_competitor") for r in eval_comp])
+    avg_gap_expect = mean([r.get("mean_gap_vs_expectations_importance_minus_client") for r in eval_expect])
 
     return {
         "criteria_total": total,
@@ -455,33 +462,33 @@ def summarise(criteria_rows):
             "importance_mean": None if avg_imp is None else round(avg_imp, 2),
             "client_mean": None if avg_cli is None else round(avg_cli, 2),
             "competitor_mean": None if avg_com is None else round(avg_com, 2),
-            "gap_vs_competitor_client_minus_competitor_mean": None if avg_gap_comp is None else round(avg_gap_comp, 2),
-            "gap_vs_expectations_importance_minus_client_mean": None if avg_gap_expect is None else round(avg_gap_expect, 2)
+            "mean_gap_vs_competitor_client_minus_competitor": None if avg_gap_comp is None else round(avg_gap_comp, 2),
+            "mean_gap_vs_expectations_importance_minus_client": None if avg_gap_expect is None else round(avg_gap_expect, 2)
         },
 
-        "top3_competitive_advantages_gap_vs_competitor_client_minus_competitor": [
+        "top3_competitive_advantages_mean_gap_vs_competitor_client_minus_competitor": [
             {"gap_no": r["gap_no"], "section": r["section"], "criterion": r["criterion"],
-             "gap_vs_competitor_client_minus_competitor": r["mean_gap_vs_competitor_client_minus_competitor"]}
+             "mean_gap_vs_competitor_client_minus_competitor": r["mean_gap_vs_competitor_client_minus_competitor"]}
             for r in top_adv
         ],
-        "top3_behind_competition_gap_vs_competitor_client_minus_competitor": [
+        "top3_behind_competition_mean_gap_vs_competitor_client_minus_competitor": [
             {"gap_no": r["gap_no"], "section": r["section"], "criterion": r["criterion"],
-             "gap_vs_competitor_client_minus_competitor": r["mean_gap_vs_competitor_client_minus_competitor"]}
+             "mean_gap_vs_competitor_client_minus_competitor": r["mean_gap_vs_competitor_client_minus_competitor"]}
             for r in top_beh
         ],
-        "top3_gaps_vs_expectations_importance_minus_client": [
+        "top3_gaps_vs_expectations_mean_gap_vs_expectations_importance_minus_client": [
             {"gap_no": r["gap_no"], "section": r["section"], "criterion": r["criterion"],
-             "gap_vs_expectations_importance_minus_client": r["mean_gap_vs_expectations_importance_minus_client"]}
+             "mean_gap_vs_expectations_importance_minus_client": r["mean_gap_vs_expectations_importance_minus_client"]}
             for r in top_expect
         ],
 
-        "note": "Missing: 0 / 999 / blanks excluded. Gaps are pairwise (both values must be present)."
+        "note": "Missing: 0 / 999 / blanks excluded. Gaps are pairwise (both values must exist)."
     }
 
 def pick_comment_samples(criteria_table, comments_by_gap, max_gaps=12, per_gap=6):
     """Keep prompt small: focus on biggest expectation gaps and most negative competitor gaps."""
-    eval_expect = [r for r in criteria_table if r["mean_gap_vs_expectations_importance_minus_client"] is not None]
-    eval_comp = [r for r in criteria_table if r["mean_gap_vs_competitor_client_minus_competitor"] is not None]
+    eval_expect = [r for r in criteria_table if r.get("mean_gap_vs_expectations_importance_minus_client") is not None]
+    eval_comp = [r for r in criteria_table if r.get("mean_gap_vs_competitor_client_minus_competitor") is not None]
 
     top_expect = sorted(eval_expect, key=lambda r: r["mean_gap_vs_expectations_importance_minus_client"], reverse=True)[:6]
     top_beh = sorted(eval_comp, key=lambda r: r["mean_gap_vs_competitor_client_minus_competitor"])[:6]  # most negative first
@@ -618,7 +625,7 @@ TOOL_SCHEMA = {
             },
             "sections": {
                 "type": "array",
-                "minItems": 1,  # IMPORTANT: prevent empty sections
+                "minItems": 1,
                 "items": {
                     "type": "object",
                     "properties": {
@@ -672,7 +679,7 @@ OVERALL STATS:
 SECTION STATS:
 {json.dumps(section_stats, ensure_ascii=False, indent=2)}
 
-CRITERION TABLE (means & gap means):
+CRITERION TABLE (means & mean gaps):
 {json.dumps(criterion_table_small, ensure_ascii=False, indent=2)}
 
 COMMENT SAMPLES (use for improvement suggestions; refer to section/criterion when possible):
@@ -733,7 +740,7 @@ def sections_by_name(sections_list):
 # Streamlit UI
 # --------------------
 st.set_page_config(page_title="GapCoder", layout="wide")
-st.markdown(f"# 📊 GapCoder (v1.6)\n_Last updated: {datetime.now():%Y-%m-%d}_")
+st.markdown(f"# 📊 GapCoder (v1.6.1)\n_Last updated: {datetime.now():%Y-%m-%d}_")
 
 projects = load_projects(PROJECTS_FILE)
 client = Anthropic(api_key=st.secrets.get("ANTHROPIC_API_KEY", ""))
@@ -885,8 +892,8 @@ if st.button("🧠 Generate GAP Analysis"):
             "mean_importance": r["mean_importance"],
             "mean_client": r["mean_client"],
             "mean_competitor": r["mean_competitor"],
-            "gap_vs_expectations_importance_minus_client": r["mean_gap_vs_expectations_importance_minus_client"],
-            "gap_vs_competitor_client_minus_competitor": r["mean_gap_vs_competitor_client_minus_competitor"],
+            "mean_gap_vs_expectations_importance_minus_client": r["mean_gap_vs_expectations_importance_minus_client"],
+            "mean_gap_vs_competitor_client_minus_competitor": r["mean_gap_vs_competitor_client_minus_competitor"],
             "n_gap_vs_expectations": r["n_gap_vs_expectations"],
             "n_gap_vs_competitor": r["n_gap_vs_competitor"],
         })
@@ -937,7 +944,6 @@ if st.button("🧠 Generate GAP Analysis"):
             "Running a one-time repair call focused on sections…"
         )
 
-        # Create a smaller payload: by-section criteria lists only (keeps repair prompt smaller)
         section_detail = {sec: grouped.get(sec, []) for sec in section_names}
 
         repair_prompt = f"""
@@ -974,7 +980,6 @@ Produce:
             parsed2, msg2 = call_claude(repair_prompt, client)
 
         if isinstance(parsed2, dict) and (parsed2.get("sections") or []):
-            # Keep original total overview if it exists; replace sections with repaired ones
             parsed["sections"] = parsed2.get("sections", parsed["sections"])
         else:
             st.error("Repair attempt failed. Showing raw output below.")
