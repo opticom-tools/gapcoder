@@ -1,24 +1,29 @@
 # -------------------------------------------------------------
-# GapCoder v1.3 — GAP Analysis Summariser (Importance / Client / Competitor + Comments)
+# GapCoder v1.4 — GAP Analysis Summariser (Importance / Client / Competitor + Comments)
 #
-# Primary column format:
+# Column format supported (primary):
 #   gap_imp_1, gap_perf_1, gap_comp_1, gap_comm_1
 # Backward compatible:
 #   gap1_imp, gap1_perf, gap1_comp, gap1_comm
 #
-# Input methods:
+# Inputs:
 # - Upload .xlsx (recommended when comments are long / may contain line breaks)
-# - Paste TSV/CSV copied from Excel
+# - Paste TSV/CSV copied from Excel (works when rows are clean)
 #
 # Gap Dictionary (required):
-#   1 = Section | Gap name
+#   1 = Section Name | Criterion Name
 #
-# Missing rules:
-# - 999 = don't know  -> treated as missing
-# - 0   = no answer   -> treated as missing
+# Missing rules (excluded from all means & gaps):
+# - 999 = don't know
+# - 0   = no answer
 # - blank = missing
-# - If competitor missing but imp/perf exist -> "competitor refused" (row-level signal)
-# - If imp+perf+comp all missing -> "not asked to respondent" (row-level signal)
+#
+# IMPORTANT (pairwise gaps):
+# - Gap vs Expectations is calculated per respondent only when BOTH Importance and Client score exist:
+#     (Importance - Client)
+# - Gap vs Competitor is calculated per respondent only when BOTH Client and Competitor score exist:
+#     (Client - Competitor)
+# - Means of gaps are averages of those respondent-level gaps (NOT gap-of-means).
 # -------------------------------------------------------------
 
 import streamlit as st
@@ -41,9 +46,9 @@ except Exception:
 # Config
 # --------------------
 CLAUDE_MODEL = "claude-sonnet-4-5"
-MAX_CLAUDE_TOKENS = 2800
+MAX_CLAUDE_TOKENS = 2600
 PROJECTS_FILE = "gapcoder_projects.json"
-SAME_TOL = 0.05
+SAME_TOL = 0.05  # used only for lead/tie/lag buckets
 
 # NEW format: gap_imp_1
 GAP_COL_RE_NEW = re.compile(r"^gap_(imp|perf|comp|comm)_(\d+)$", re.IGNORECASE)
@@ -72,7 +77,6 @@ def save_projects(path: str, data: dict) -> None:
 # Parsing helpers
 # --------------------
 def detect_delimiter_from_header(header_line: str) -> str:
-    # Best-effort, keeps it simple
     if "\t" in header_line:
         return "\t"
     if ";" in header_line and "," not in header_line:
@@ -100,11 +104,11 @@ def parse_table_paste(text: str):
     if not text or not text.strip():
         raise ValueError("No data pasted.")
 
-    # Remove fully empty lines (common when pasting)
+    # Remove fully empty lines
     lines = [ln for ln in text.splitlines() if ln.strip() != ""]
     if len(lines) < 2:
         raise ValueError(
-            "It looks like you only pasted one line (likely just the header, or header+values without row breaks). "
+            "It looks like you only pasted one line (often just the header, or header+values without row breaks). "
             "Try copying the full Excel table again, or use the .xlsx upload option."
         )
 
@@ -121,7 +125,7 @@ def parse_table_paste(text: str):
 
     rows = []
     for row in reader:
-        # Skip completely empty rows
+        # Skip empty rows
         if not any(str(v).strip() for v in row if v is not None):
             continue
         # Pad / trim to header length
@@ -133,8 +137,8 @@ def parse_table_paste(text: str):
 
     if not rows:
         raise ValueError(
-            "No rows found under the header. This often happens when Excel comments contain hidden line breaks, "
-            "or the paste didn't include any respondent rows. Recommendation: upload the .xlsx instead."
+            "No rows found under the header. This can happen when comments contain hidden line breaks, "
+            "or the paste didn't include respondent rows. Recommendation: upload the .xlsx instead."
         )
 
     return headers, rows
@@ -147,10 +151,10 @@ def parse_table_xlsx(uploaded_file):
     wb = load_workbook(BytesIO(data), data_only=True)
     ws = wb.active
 
-    # Read header row (row 1)
+    # Header row
     raw_headers = [cell.value for cell in next(ws.iter_rows(min_row=1, max_row=1))]
     if not raw_headers or all(h is None or str(h).strip() == "" for h in raw_headers):
-        raise ValueError("The first row in the Excel file is empty. Please ensure row 1 contains headers.")
+        raise ValueError("Row 1 in the Excel file is empty. Please ensure row 1 contains headers.")
 
     headers = normalise_headers(raw_headers)
 
@@ -160,6 +164,7 @@ def parse_table_xlsx(uploaded_file):
             continue
         if not any(v is not None and str(v).strip() != "" for v in r):
             continue
+
         row = list(r)
         if len(row) < len(headers):
             row = row + [""] * (len(headers) - len(row))
@@ -172,7 +177,7 @@ def parse_table_xlsx(uploaded_file):
             if v is None:
                 cleaned[h] = ""
             else:
-                cleaned[h] = str(v).strip() if not isinstance(v, (int, float)) else v
+                cleaned[h] = v  # keep numbers as numbers; strings as strings
         rows.append(cleaned)
 
     if not rows:
@@ -180,26 +185,27 @@ def parse_table_xlsx(uploaded_file):
     return headers, rows
 
 def parse_score(value):
+    """Returns numeric float or None. Treats 0, 999 and blanks as missing."""
     if value is None:
-        return None, "blank"
+        return None
 
-    # Keep numeric as-is when coming from xlsx
+    # Numeric already (xlsx path)
     if isinstance(value, (int, float)):
         num = float(value)
     else:
         s = str(value).strip()
         if s == "":
-            return None, "blank"
+            return None
         try:
             num = float(s.replace(",", "."))
         except:
-            return None, "blank"
+            return None
 
     if abs(num - 0.0) < 1e-12:
-        return None, "no_answer_0"
+        return None
     if abs(num - 999.0) < 1e-12:
-        return None, "dont_know_999"
-    return num, None
+        return None
+    return num
 
 def parse_gap_dictionary(text: str):
     """
@@ -303,6 +309,13 @@ def mean(vals):
         return None
     return sum(vv) / len(vv)
 
+def mean_gap(vals):
+    """Mean of respondent-level gaps (already computed), excluding None."""
+    vv = [v for v in vals if v is not None]
+    if not vv:
+        return None
+    return sum(vv) / len(vv)
+
 def classify_vs_comp(gap):
     if gap is None:
         return None
@@ -312,109 +325,95 @@ def classify_vs_comp(gap):
         return "lagging"
     return "same"
 
-def compute_criterion_table(rows, gaps, col_map, resp_id_col, gap_dict):
+def compute_tables(rows, gaps, col_map, resp_id_col, gap_dict):
     """
     Returns:
-      criterion_table: list[dict]
+      criterion_table: list[dict] (NO 'not asked' / 'competitor refused' fields)
       comments_by_gap: dict gap_no -> list of {"resp_id","comment"} (truncated)
-      data_quality: dict
     """
     criterion_table = []
     comments_by_gap = {}
-    data_quality = {"note": "0, 999 and blanks treated as missing and ignored in means."}
 
-    # Collect comments by gap (we'll later sample only the important ones)
+    # Collect comments by gap
     for n in gaps:
         comm_col = col_map.get((n, "comm"))
         if not comm_col:
             continue
         bucket = []
         for i, r in enumerate(rows, start=1):
-            resp_id = (r.get(resp_id_col) if resp_id_col else None) or f"RESP_{i:03d}"
+            resp_id = (r.get(resp_id_col) if resp_id_col else None)
+            resp_id = str(resp_id).strip() if resp_id is not None and str(resp_id).strip() != "" else f"RESP_{i:03d}"
             c = r.get(comm_col, "")
-            c = c if c is not None else ""
-            c = str(c).strip()
+            c = "" if c is None else str(c).strip()
             if c:
                 if len(c) > 280:
                     c = c[:280].rstrip() + "…"
-                bucket.append({"resp_id": str(resp_id).strip(), "comment": c})
+                bucket.append({"resp_id": resp_id, "comment": c})
         if bucket:
             comments_by_gap[n] = bucket
 
+    # Compute means + pairwise gaps
     for n in gaps:
         imp_col = col_map.get((n, "imp"))
         perf_col = col_map.get((n, "perf"))
         comp_col = col_map.get((n, "comp"))
 
         imp_vals, perf_vals, comp_vals = [], [], []
-        rows_total = len(rows)
-        rows_not_asked = 0
-        rows_comp_refused = 0
-        pairs_expect = 0
-        pairs_comp = 0
-
-        missing_counts = {
-            "Importance": {"blank": 0, "no_answer_0": 0, "dont_know_999": 0},
-            "Client": {"blank": 0, "no_answer_0": 0, "dont_know_999": 0},
-            "Competitor": {"blank": 0, "no_answer_0": 0, "dont_know_999": 0},
-        }
+        gap_expect_vals = []  # (imp - perf) per respondent if both exist
+        gap_comp_vals = []    # (perf - comp) per respondent if both exist
 
         for r in rows:
-            imp, imp_m = parse_score(r.get(imp_col, "") if imp_col else "")
-            perf, perf_m = parse_score(r.get(perf_col, "") if perf_col else "")
-            comp, comp_m = parse_score(r.get(comp_col, "") if comp_col else "")
-
-            if imp_m: missing_counts["Importance"][imp_m] += 1
-            if perf_m: missing_counts["Client"][perf_m] += 1
-            if comp_m: missing_counts["Competitor"][comp_m] += 1
-
-            if imp is None and perf is None and comp is None:
-                rows_not_asked += 1
-
-            if comp is None and (imp is not None or perf is not None):
-                rows_comp_refused += 1
+            imp = parse_score(r.get(imp_col, "") if imp_col else "")
+            perf = parse_score(r.get(perf_col, "") if perf_col else "")
+            comp = parse_score(r.get(comp_col, "") if comp_col else "")
 
             imp_vals.append(imp)
             perf_vals.append(perf)
             comp_vals.append(comp)
 
+            # Pairwise expectation gap only when BOTH exist
             if imp is not None and perf is not None:
-                pairs_expect += 1
+                gap_expect_vals.append(imp - perf)
+            else:
+                gap_expect_vals.append(None)
+
+            # Pairwise competitor gap only when BOTH exist
             if perf is not None and comp is not None:
-                pairs_comp += 1
+                gap_comp_vals.append(perf - comp)
+            else:
+                gap_comp_vals.append(None)
+
+        meta = gap_dict.get(n, {"section": "Unmapped", "criterion": f"Gap {n}"})
 
         imp_mean = mean(imp_vals)
         perf_mean = mean(perf_vals)
         comp_mean = mean(comp_vals)
 
-        gap_expect = (imp_mean - perf_mean) if (imp_mean is not None and perf_mean is not None) else None
-        gap_comp = (perf_mean - comp_mean) if (perf_mean is not None and comp_mean is not None) else None
-
-        meta = gap_dict.get(n, {"section": "Unmapped", "criterion": f"Gap {n}"})
+        gap_expect_mean = mean_gap(gap_expect_vals)
+        gap_comp_mean = mean_gap(gap_comp_vals)
 
         criterion_table.append({
             "gap_no": n,
             "section": meta["section"],
             "criterion": meta["criterion"],
 
-            "rows_total": rows_total,
-            "rows_not_asked": rows_not_asked,
-            "rows_competitor_refused": rows_comp_refused,
-
             "mean_importance": None if imp_mean is None else round(imp_mean, 2),
             "mean_client": None if perf_mean is None else round(perf_mean, 2),
             "mean_competitor": None if comp_mean is None else round(comp_mean, 2),
 
-            "mean_gap_vs_expectations": None if gap_expect is None else round(gap_expect, 2),
-            "mean_gap_vs_competitor": None if gap_comp is None else round(gap_comp, 2),
+            # IMPORTANT: these are means of respondent-level gaps
+            "mean_gap_vs_expectations": None if gap_expect_mean is None else round(gap_expect_mean, 2),  # imp - perf
+            "mean_gap_vs_competitor": None if gap_comp_mean is None else round(gap_comp_mean, 2),        # perf - comp
 
-            "valid_pairs_vs_expectations": pairs_expect,
-            "valid_pairs_vs_competitor": pairs_comp,
-
-            "missing_counts": missing_counts,
+            # Useful reliability counts (not “refusals/not asked”)
+            "n_importance": sum(1 for v in imp_vals if v is not None),
+            "n_client": sum(1 for v in perf_vals if v is not None),
+            "n_competitor": sum(1 for v in comp_vals if v is not None),
+            "n_gap_vs_expectations": sum(1 for v in gap_expect_vals if v is not None),
+            "n_gap_vs_competitor": sum(1 for v in gap_comp_vals if v is not None),
         })
 
-    return criterion_table, comments_by_gap, data_quality
+    return criterion_table, comments_by_gap
 
 def summarise(criteria_rows):
     total = len(criteria_rows)
@@ -438,9 +437,6 @@ def summarise(criteria_rows):
     avg_gap_comp = mean([r["mean_gap_vs_competitor"] for r in eval_comp])
     avg_gap_expect = mean([r["mean_gap_vs_expectations"] for r in eval_expect])
 
-    rows_comp_refused_total = sum(r["rows_competitor_refused"] for r in criteria_rows)
-    rows_not_asked_total = sum(r["rows_not_asked"] for r in criteria_rows)
-
     return {
         "criteria_total": total,
         "criteria_evaluable_vs_competitor": len(eval_comp),
@@ -450,39 +446,34 @@ def summarise(criteria_rows):
             "importance": None if avg_imp is None else round(avg_imp, 2),
             "client": None if avg_cli is None else round(avg_cli, 2),
             "competitor": None if avg_com is None else round(avg_com, 2),
-            "gap_vs_competitor": None if avg_gap_comp is None else round(avg_gap_comp, 2),
-            "gap_vs_expectations": None if avg_gap_expect is None else round(avg_gap_expect, 2),
+            "gap_vs_competitor": None if avg_gap_comp is None else round(avg_gap_comp, 2),      # perf - comp
+            "gap_vs_expectations": None if avg_gap_expect is None else round(avg_gap_expect, 2) # imp - perf
         },
         "top3_leading_vs_competitor": [
-            {"gap_no": r["gap_no"], "section": r["section"], "criterion": r["criterion"], "gap": r["mean_gap_vs_competitor"]}
+            {"gap_no": r["gap_no"], "section": r["section"], "criterion": r["criterion"], "gap_perf_minus_comp": r["mean_gap_vs_competitor"]}
             for r in top_leading
         ],
         "top3_lagging_vs_competitor": [
-            {"gap_no": r["gap_no"], "section": r["section"], "criterion": r["criterion"], "gap": r["mean_gap_vs_competitor"]}
+            {"gap_no": r["gap_no"], "section": r["section"], "criterion": r["criterion"], "gap_perf_minus_comp": r["mean_gap_vs_competitor"]}
             for r in top_lagging
         ],
         "top3_gaps_vs_expectations": [
-            {"gap_no": r["gap_no"], "section": r["section"], "criterion": r["criterion"], "gap": r["mean_gap_vs_expectations"]}
+            {"gap_no": r["gap_no"], "section": r["section"], "criterion": r["criterion"], "gap_imp_minus_perf": r["mean_gap_vs_expectations"]}
             for r in top_expect_gaps
         ],
-        "data_quality_signals": {
-            "respondent_rows_competitor_refused_total": rows_comp_refused_total,
-            "respondent_rows_not_asked_total": rows_not_asked_total,
-            "note": "0, 999 and blanks are treated as missing and ignored in means."
-        }
+        "note": "Missing handling: 0, 999 and blanks excluded. Gaps use pairwise scoring (both values must be present)."
     }
 
 def pick_comment_samples(criteria_table, comments_by_gap, max_gaps=12, per_gap=6):
     """
     Keep prompt small:
-    - focus on biggest gaps vs expectations + most lagging vs competitor
-    - sample a few comments per priority gap
+    - focus on biggest expectation gaps (imp - perf) and most negative competitor gaps (perf - comp)
     """
     eval_expect = [r for r in criteria_table if r["mean_gap_vs_expectations"] is not None]
     eval_comp = [r for r in criteria_table if r["mean_gap_vs_competitor"] is not None]
 
     top_expect = sorted(eval_expect, key=lambda r: r["mean_gap_vs_expectations"], reverse=True)[:6]
-    top_lag = sorted(eval_comp, key=lambda r: r["mean_gap_vs_competitor"])[:6]
+    top_lag = sorted(eval_comp, key=lambda r: r["mean_gap_vs_competitor"])[:6]  # most negative first
 
     priority = []
     seen = set()
@@ -500,34 +491,39 @@ def pick_comment_samples(criteria_table, comments_by_gap, max_gaps=12, per_gap=6
             out[n] = bucket[:per_gap]
     return out
 
-def build_claude_prompt(ctx, criteria_table, overall_stats, section_stats, comment_samples, data_quality):
+def build_prompt(ctx, criteria_for_prompt, overall_stats, section_stats, comment_samples):
     json_template = {
-        "total_gap_overview": {"slide_bullets": ["..."], "narrative": "..."},
-        "sections": [{"section": "Section name", "slide_bullets": ["..."], "narrative": "..."}]
+        "total_gap_overview": {
+            "slide_bullets": ["..."],
+            "narrative": "..."
+        },
+        "sections": [
+            {
+                "section": "Section name",
+                "slide_bullets": ["..."],
+                "narrative": "..."
+            }
+        ]
     }
 
     prompt = f"""
-You are a senior market research consultant. Write a GAP analysis summary that is slide-ready and grounded in the provided stats and comment samples.
+You are a senior market research consultant. Write a GAP analysis summary that is slide-ready and grounded ONLY in the provided statistics and comment samples.
 
-CRITICAL RULES:
+DEFINITIONS (use these labels consistently):
+- Gap vs Expectations = (Importance - Client performance). Positive means: under-delivery vs what matters.
+- Gap vs Competitor = (Client performance - Competitor performance). Positive means: client leads competitor.
+
+RULES:
 - Do NOT invent numbers.
-- Use provided stats for totals/counts/top gaps.
-- Mention briefly if competitor benchmarking is limited (missing/refused) or if some gaps were not asked.
-- Output MUST be valid JSON only (no backticks, no extra commentary) matching the JSON template.
+- Use the provided overall/section stats and criterion table.
+- Missing handling: 0, 999 and blanks are excluded. Gaps are computed pairwise (both values must exist).
+- Output MUST be valid JSON only (no backticks, no commentary) matching the JSON template.
 
 PROJECT CONTEXT:
 - Project: {ctx.get("project_no","")}
 - Client: {ctx.get("client_name","")}
 - Industry: {ctx.get("industry","")}
 - Objectives: {ctx.get("objectives","")}
-
-DEFINITIONS:
-- Gap vs Competitor = mean_client - mean_competitor (positive = client leads)
-- Gap vs Expectations = mean_importance - mean_client (positive = client under-delivers vs what matters)
-- Missing handling: 0, 999 and blanks were ignored in means.
-
-DATA QUALITY NOTE:
-{json.dumps(data_quality, ensure_ascii=False, indent=2)}
 
 OVERALL STATS:
 {json.dumps(overall_stats, ensure_ascii=False, indent=2)}
@@ -536,40 +532,87 @@ SECTION STATS:
 {json.dumps(section_stats, ensure_ascii=False, indent=2)}
 
 CRITERION TABLE:
-{json.dumps(criteria_table, ensure_ascii=False, indent=2)}
+{json.dumps(criteria_for_prompt, ensure_ascii=False, indent=2)}
 
-COMMENT SAMPLES (use for improvement suggestions; cite gap/section where possible):
+COMMENT SAMPLES (use for improvement suggestions; refer to section/criterion when possible):
 {json.dumps(comment_samples, ensure_ascii=False, indent=2)}
 
 WHAT TO PRODUCE:
 1) Total GAP overview (200–400 words narrative + slide bullets)
    Include:
-   - how many criteria in total
+   - how many criteria evaluated
    - high-level remark
-   - how many leading/same/lagging vs competition (where evaluable)
-   - top 3 leading vs competition + biggest gaps vs competition
-   - biggest gaps vs expectations
-   - main improvement suggestions from customers (from comments)
+   - how many leading/same/lagging vs competitor (where evaluable)
+   - top 3 leading vs competitor + weakest competitive positions (smallest leads / negative gaps)
+   - largest gaps vs expectations (Importance - Client)
+   - key improvement themes based on comment samples
 2) Key findings per section (200–300 words each + slide bullets)
    Cover:
-   - expectations met in general
-   - top gaps vs expectations
-   - performance vs competition
-   - top gaps vs competition / where lagging
-   - improvement suggestions from comments
+   - expectations met in general (Importance vs Client)
+   - top gaps vs expectations (Importance - Client)
+   - performance vs competition (Client - Competitor)
+   - where lagging / weakest vs competition
+   - improvement suggestions based on comment samples
 
 OUTPUT FORMAT:
 Return JSON matching this template exactly:
 {json.dumps(json_template, ensure_ascii=False, indent=2)}
 """
-    return prompt.strip()
+    return prompt.strip(), json_template
+
+def safe_json_loads(text: str):
+    """
+    1) direct json.loads
+    2) try extracting substring from first { to last }
+    """
+    t = (text or "").strip()
+    if not t:
+        return None, "Empty response."
+
+    try:
+        return json.loads(t), None
+    except Exception:
+        pass
+
+    start = t.find("{")
+    end = t.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        candidate = t[start:end+1].strip()
+        try:
+            return json.loads(candidate), None
+        except Exception as e:
+            return None, f"JSON parse failed after extraction: {e}"
+
+    return None, "No JSON object detected."
+
+def repair_to_json(client, model, json_template, bad_text: str):
+    """
+    Ask Claude to repair malformed JSON (no additional content).
+    """
+    repair_prompt = f"""
+You returned content that is not valid JSON.
+
+Fix it so that the output is VALID JSON ONLY (no backticks, no extra text) and matches this template structure:
+{json.dumps(json_template, ensure_ascii=False, indent=2)}
+
+Here is the previous output to repair:
+{bad_text}
+""".strip()
+
+    repaired = client.messages.create(
+        model=model,
+        max_tokens=1200,
+        temperature=0.0,
+        messages=[{"role": "user", "content": repair_prompt}],
+    ).content[0].text.strip()
+    return repaired
 
 
 # --------------------
 # Streamlit UI
 # --------------------
 st.set_page_config(page_title="GapCoder", layout="wide")
-st.markdown(f"# 📊 GapCoder (v1.3)\n_Last updated: {datetime.now():%Y-%m-%d}_")
+st.markdown(f"# 📊 GapCoder (v1.4)\n_Last updated: {datetime.now():%Y-%m-%d}_")
 
 projects = load_projects(PROJECTS_FILE)
 client = Anthropic(api_key=st.secrets.get("ANTHROPIC_API_KEY", ""))
@@ -607,7 +650,6 @@ with st.expander("1. Project Context", expanded=True):
         projects[project_no] = ctx
         save_projects(PROJECTS_FILE, projects)
 
-    # Small sanity feedback for dictionary
     gd = parse_gap_dictionary(gap_dict_raw)
     if gd:
         secs = sorted({v["section"] for v in gd.values()})
@@ -617,11 +659,11 @@ with st.expander("1. Project Context", expanded=True):
 
 with st.expander("2. Input data (simple)", expanded=True):
     st.markdown(
-        "**Recommended:** Upload the Excel file (.xlsx). This avoids copy-paste issues when comments contain line breaks.\n\n"
+        "**Recommended:** Upload the Excel file (.xlsx). This avoids copy/paste issues when comments contain line breaks.\n\n"
         "Supported headers:\n"
         "- `gap_imp_1`, `gap_perf_1`, `gap_comp_1`, `gap_comm_1` (primary)\n"
         "- `gap1_imp` etc. (fallback)\n\n"
-        "Missing rules: blank / `0` / `999` are treated as missing and ignored in means."
+        "Missing rules: blank / `0` / `999` are treated as missing and ignored in all means and gaps."
     )
 
     input_mode = st.radio("How do you want to provide data?", ["Upload Excel (.xlsx)", "Paste table (TSV/CSV)"], index=0)
@@ -633,7 +675,7 @@ with st.expander("2. Input data (simple)", expanded=True):
         if not XLSX_OK:
             st.error("Excel upload needs openpyxl. Add it to requirements.txt and redeploy.")
         uploaded = st.file_uploader("Upload .xlsx", type=["xlsx"])
-        st.caption("Tip: make sure row 1 contains headers and each following row is one respondent.")
+        st.caption("Tip: row 1 = headers. Each following row = one respondent.")
     else:
         st.code(
             "ID\tgap_imp_1\tgap_perf_1\tgap_comp_1\tgap_comm_1\n"
@@ -679,9 +721,9 @@ if st.button("🧠 Generate GAP Analysis"):
 
     resp_id_col = detect_resp_id_col(headers, rows)
     if resp_id_col is None:
-        st.warning("No RESP_ID/ID column detected. I will label rows as RESP_001, RESP_002, ...")
+        st.warning("No RESP_ID/ID column detected. Rows will be labelled as RESP_001, RESP_002, ...")
 
-    # Optional: choose a section before running
+    # Filter for one section (optional)
     selected_section = None
     if ctx.get("mode") == "One section":
         all_sections = sorted({gap_dict[n]["section"] for n in gaps})
@@ -691,7 +733,8 @@ if st.button("🧠 Generate GAP Analysis"):
             st.error("No gaps found for selected section.")
             st.stop()
 
-    criterion_table, comments_by_gap, data_quality = compute_criterion_table(
+    # Compute tables
+    criterion_table, comments_by_gap = compute_tables(
         rows=rows,
         gaps=gaps,
         col_map=col_map,
@@ -708,28 +751,50 @@ if st.button("🧠 Generate GAP Analysis"):
 
     comment_samples = pick_comment_samples(criterion_table, comments_by_gap, max_gaps=12, per_gap=6)
 
+    # Reduce table for Claude (smaller + clearer)
+    criteria_for_prompt = []
+    for r in criterion_table:
+        criteria_for_prompt.append({
+            "gap_no": r["gap_no"],
+            "section": r["section"],
+            "criterion": r["criterion"],
+            "mean_importance": r["mean_importance"],
+            "mean_client": r["mean_client"],
+            "mean_competitor": r["mean_competitor"],
+            "mean_gap_vs_expectations_imp_minus_perf": r["mean_gap_vs_expectations"],
+            "mean_gap_vs_competitor_perf_minus_comp": r["mean_gap_vs_competitor"],
+            "n_gap_vs_expectations": r["n_gap_vs_expectations"],
+            "n_gap_vs_competitor": r["n_gap_vs_competitor"],
+        })
+
     st.subheader("Quick sanity check (computed from your data)")
     st.write(overall_stats)
 
     st.markdown("### Criterion table (means & gaps)")
-    st.dataframe(criterion_table, use_container_width=True)
+    st.dataframe(criteria_for_prompt, use_container_width=True)
 
-    prompt = build_claude_prompt(ctx, criterion_table, overall_stats, section_stats, comment_samples, data_quality)
+    prompt, json_template = build_prompt(ctx, criteria_for_prompt, overall_stats, section_stats, comment_samples)
 
     with st.spinner("🤖 Claude is thinking…"):
-        result = client.messages.create(
+        raw = client.messages.create(
             model=CLAUDE_MODEL,
             max_tokens=MAX_CLAUDE_TOKENS,
-            temperature=0.3,
+            temperature=0.2,
             messages=[{"role": "user", "content": prompt}],
         ).content[0].text.strip()
 
-    try:
-        parsed = json.loads(result)
-    except json.JSONDecodeError:
-        st.error("Claude did not return valid JSON. Showing raw output below.")
-        st.text_area("Raw output", result, height=300)
-        st.stop()
+    parsed, err = safe_json_loads(raw)
+
+    # If invalid JSON: try repair once
+    if parsed is None:
+        repaired = repair_to_json(client, CLAUDE_MODEL, json_template, raw)
+        parsed, err2 = safe_json_loads(repaired)
+        if parsed is None:
+            st.error("Claude did not return valid JSON (even after one repair attempt). Showing raw output below.")
+            st.text_area("Raw output", raw, height=300)
+            st.stop()
+        else:
+            raw = repaired  # for transparency if you want to display later
 
     total = parsed.get("total_gap_overview", {})
     sections_out = parsed.get("sections", [])
@@ -740,7 +805,7 @@ if st.button("🧠 Generate GAP Analysis"):
         st.markdown("### Slide bullets")
         st.text_area("Bullets", "\n".join(total.get("slide_bullets", [])), height=180)
         st.markdown("### Narrative")
-        st.text_area("Narrative", total.get("narrative", ""), height=240)
+        st.text_area("Narrative", total.get("narrative", ""), height=260)
 
     with tabs[1]:
         if not sections_out:
@@ -753,22 +818,23 @@ if st.button("🧠 Generate GAP Analysis"):
             st.markdown("### Slide bullets")
             st.text_area("Bullets", "\n".join(chosen.get("slide_bullets", [])), height=180)
             st.markdown("### Narrative")
-            st.text_area("Narrative", chosen.get("narrative", ""), height=240)
+            st.text_area("Narrative", chosen.get("narrative", ""), height=260)
 
     with tabs[2]:
         st.markdown("### Total overview (copy)")
         st.text_area(
             "Total (copy)",
             "BULLETS:\n" + "\n".join(total.get("slide_bullets", [])) + "\n\nNARRATIVE:\n" + total.get("narrative", ""),
-            height=260
+            height=280
         )
+
         st.markdown("### Sections (copy)")
         combined = []
         for s in sections_out:
             combined.append(f"== {s.get('section','Unnamed')} ==\n")
             combined.append("BULLETS:\n" + "\n".join(s.get("slide_bullets", [])) + "\n")
             combined.append("NARRATIVE:\n" + s.get("narrative", "") + "\n\n")
-        st.text_area("Sections (copy)", "\n".join(combined), height=320)
+        st.text_area("Sections (copy)", "\n".join(combined), height=360)
 
 # Sidebar context
 st.sidebar.header("Project Context")
