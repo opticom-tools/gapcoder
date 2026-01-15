@@ -1,16 +1,9 @@
 # -------------------------------------------------------------
-# GapCoder v1.6.1 — GAP Analysis Summariser (Importance / Client / Competitor + Comments)
+# GapCoder v1.6.2 — GAP Analysis Summariser (Importance / Client / Competitor + Comments)
 # Last updated: 2026-01-15
 #
 # Supported headers (ONLY; no fallback):
 #   gap_imp_1, gap_perf_1, gap_comp_1, gap_comm_1 (and so on)
-#
-# Input:
-# - Upload .xlsx (recommended when comments are long / may contain line breaks)
-# - Paste TSV/CSV copied from Excel (works when rows are clean)
-#
-# Gap Dictionary (required):
-#   1 = Section Name | Criterion Name
 #
 # Missing rules (excluded from all means & gaps):
 # - 999 = don't know
@@ -18,11 +11,9 @@
 # - blank = missing
 #
 # IMPORTANT (pairwise gaps):
-# - Gap vs Expectations is computed per respondent only when BOTH Importance and Client exist:
-#     (Importance - Client)
-# - Gap vs Competitor is computed per respondent only when BOTH Client and Competitor exist:
-#     (Client - Competitor)
-# - Means of gaps are averages of those respondent-level gaps (NOT gap-of-means).
+# - Gap vs Expectations per respondent: (Importance - Client) only if BOTH exist
+# - Gap vs Competitor   per respondent: (Client - Competitor) only if BOTH exist
+# - Means are averages of respondent-level gaps (NOT gap-of-means)
 #
 # Competitive position buckets (based on Gap vs Competitor = Client - Competitor):
 # - "Competitive advantages" if > +0.30
@@ -30,8 +21,9 @@
 # - "Similar to competition" otherwise
 #
 # Claude output reliability:
-# - Uses Anthropic tool calling to force structured output.
-# - If sections are missing/empty, runs ONE repair call focused on sections.
+# - Tool calling forces structured output.
+# - If sections missing/empty, one repair attempt.
+# - If still missing: generate sections via one Claude call per section (small prompts).
 # -------------------------------------------------------------
 
 import streamlit as st
@@ -65,17 +57,14 @@ except Exception:
 # Config
 # --------------------
 CLAUDE_MODEL = "claude-sonnet-4-5"
-MAX_CLAUDE_TOKENS = 4200  # section narratives can be long
+MAX_CLAUDE_TOKENS = 4200
 PROJECTS_FILE = "gapcoder_projects.json"
 
-# threshold for competitive position buckets (Client - Competitor)
-COMP_TOL = 0.30
+COMP_TOL = 0.30  # Client - Competitor
 
-# Supported: gap_imp_1, gap_perf_1, gap_comp_1, gap_comm_1
 GAP_COL_RE = re.compile(r"^gap_(imp|perf|comp|comm)_(\d+)$", re.IGNORECASE)
-
 RESP_ID_CANDIDATES = {"resp_id", "respondent_id", "respondent", "resp", "id"}
-ID_LIKE_RE = re.compile(r"^[A-Za-z]{2,}\d+.*$")  # e.g. UPM001, RESP_001, etc.
+ID_LIKE_RE = re.compile(r"^[A-Za-z]{2,}\d+.*$")
 
 
 # --------------------
@@ -123,7 +112,6 @@ def parse_table_paste(text: str):
     if not text or not text.strip():
         raise ValueError("No data pasted.")
 
-    # Remove fully empty lines
     lines = [ln for ln in text.splitlines() if ln.strip() != ""]
     if len(lines) < 2:
         raise ValueError(
@@ -144,10 +132,8 @@ def parse_table_paste(text: str):
 
     rows = []
     for row in reader:
-        # Skip empty rows
         if not any(str(v).strip() for v in row if v is not None):
             continue
-        # Pad / trim to header length
         if len(row) < len(headers):
             row = row + [""] * (len(headers) - len(row))
         if len(row) > len(headers):
@@ -170,7 +156,6 @@ def parse_table_xlsx(uploaded_file):
     wb = load_workbook(BytesIO(data), data_only=True)
     ws = wb.active
 
-    # Header row
     raw_headers = [cell.value for cell in next(ws.iter_rows(min_row=1, max_row=1))]
     if not raw_headers or all(h is None or str(h).strip() == "" for h in raw_headers):
         raise ValueError("Row 1 in the Excel file is empty. Please ensure row 1 contains headers.")
@@ -205,7 +190,6 @@ def parse_score(value):
     if value is None:
         return None
 
-    # Numeric already (xlsx path)
     if isinstance(value, (int, float)):
         num = float(value)
     else:
@@ -264,15 +248,8 @@ def parse_gap_dictionary(text: str):
     return mapping
 
 def build_gap_schema(headers):
-    """
-    Returns:
-      gaps: sorted list of gap numbers
-      col_map: dict[(gap_no, suffix)] -> header
-    suffix: imp, perf, comp, comm
-    """
     col_map = {}
     gap_nums = set()
-
     for h in headers:
         hh = str(h).strip()
         m = GAP_COL_RE.match(hh)
@@ -282,16 +259,13 @@ def build_gap_schema(headers):
         n = int(m.group(2))
         col_map[(n, suffix)] = h
         gap_nums.add(n)
-
     return sorted(gap_nums), col_map
 
 def detect_resp_id_col(headers, rows):
-    # 1) by name
     for h in headers:
         if str(h).strip().lower() in RESP_ID_CANDIDATES:
             return h
 
-    # 2) heuristic: look for a column that is mostly "id-like"
     best = None
     best_score = 0.0
     for h in headers:
@@ -318,14 +292,12 @@ def mean(vals):
     return sum(vv) / len(vv)
 
 def mean_gap(vals):
-    """Mean of respondent-level gaps (already computed), excluding None."""
     vv = [v for v in vals if v is not None]
     if not vv:
         return None
     return sum(vv) / len(vv)
 
 def classify_competitive_position(gap_client_minus_competitor):
-    """Buckets based on (Client - Competitor)."""
     if gap_client_minus_competitor is None:
         return None
     if gap_client_minus_competitor > COMP_TOL:
@@ -335,15 +307,10 @@ def classify_competitive_position(gap_client_minus_competitor):
     return "Similar to competition"
 
 def compute_tables(rows, gaps, col_map, resp_id_col, gap_dict):
-    """
-    Returns:
-      criterion_table: list[dict]
-      comments_by_gap: dict gap_no -> list of {"resp_id","comment"} (truncated)
-    """
     criterion_table = []
     comments_by_gap = {}
 
-    # Collect comments by gap
+    # comments
     for n in gaps:
         comm_col = col_map.get((n, "comm"))
         if not comm_col:
@@ -361,15 +328,15 @@ def compute_tables(rows, gaps, col_map, resp_id_col, gap_dict):
         if bucket:
             comments_by_gap[n] = bucket
 
-    # Compute means + pairwise gaps
+    # metrics
     for n in gaps:
         imp_col = col_map.get((n, "imp"))
         perf_col = col_map.get((n, "perf"))
         comp_col = col_map.get((n, "comp"))
 
         imp_vals, perf_vals, comp_vals = [], [], []
-        gap_vs_expect_vals = []  # (imp - perf) per respondent if both exist
-        gap_vs_comp_vals = []    # (perf - comp) per respondent if both exist
+        gap_vs_expect_vals = []  # (imp - perf) if both
+        gap_vs_comp_vals = []    # (perf - comp) if both
 
         for r in rows:
             imp = parse_score(r.get(imp_col, "") if imp_col else "")
@@ -380,10 +347,7 @@ def compute_tables(rows, gaps, col_map, resp_id_col, gap_dict):
             perf_vals.append(perf)
             comp_vals.append(comp)
 
-            # Pairwise expectation gap only when BOTH exist
             gap_vs_expect_vals.append((imp - perf) if (imp is not None and perf is not None) else None)
-
-            # Pairwise competitor gap only when BOTH exist
             gap_vs_comp_vals.append((perf - comp) if (perf is not None and comp is not None) else None)
 
         meta = gap_dict.get(n, {"section": "Unmapped", "criterion": f"Gap {n}"})
@@ -392,8 +356,8 @@ def compute_tables(rows, gaps, col_map, resp_id_col, gap_dict):
         perf_mean = mean(perf_vals)
         comp_mean = mean(comp_vals)
 
-        gap_expect_mean = mean_gap(gap_vs_expect_vals)   # Importance - Client
-        gap_comp_mean = mean_gap(gap_vs_comp_vals)       # Client - Competitor
+        gap_expect_mean = mean_gap(gap_vs_expect_vals)  # Importance - Client
+        gap_comp_mean = mean_gap(gap_vs_comp_vals)      # Client - Competitor
 
         criterion_table.append({
             "gap_no": n,
@@ -404,11 +368,9 @@ def compute_tables(rows, gaps, col_map, resp_id_col, gap_dict):
             "mean_client": None if perf_mean is None else round(perf_mean, 2),
             "mean_competitor": None if comp_mean is None else round(comp_mean, 2),
 
-            # Means of respondent-level gaps
             "mean_gap_vs_expectations_importance_minus_client": None if gap_expect_mean is None else round(gap_expect_mean, 2),
             "mean_gap_vs_competitor_client_minus_competitor": None if gap_comp_mean is None else round(gap_comp_mean, 2),
 
-            # Counts (useful for reliability)
             "n_importance": sum(1 for v in imp_vals if v is not None),
             "n_client": sum(1 for v in perf_vals if v is not None),
             "n_competitor": sum(1 for v in comp_vals if v is not None),
@@ -419,12 +381,6 @@ def compute_tables(rows, gaps, col_map, resp_id_col, gap_dict):
     return criterion_table, comments_by_gap
 
 def summarise(criteria_rows):
-    """
-    Expects rows with:
-      mean_gap_vs_competitor_client_minus_competitor
-      mean_gap_vs_expectations_importance_minus_client
-      mean_importance / mean_client / mean_competitor
-    """
     total = len(criteria_rows)
 
     eval_comp = [r for r in criteria_rows if r.get("mean_gap_vs_competitor_client_minus_competitor") is not None]
@@ -486,12 +442,11 @@ def summarise(criteria_rows):
     }
 
 def pick_comment_samples(criteria_table, comments_by_gap, max_gaps=12, per_gap=6):
-    """Keep prompt small: focus on biggest expectation gaps and most negative competitor gaps."""
     eval_expect = [r for r in criteria_table if r.get("mean_gap_vs_expectations_importance_minus_client") is not None]
     eval_comp = [r for r in criteria_table if r.get("mean_gap_vs_competitor_client_minus_competitor") is not None]
 
     top_expect = sorted(eval_expect, key=lambda r: r["mean_gap_vs_expectations_importance_minus_client"], reverse=True)[:6]
-    top_beh = sorted(eval_comp, key=lambda r: r["mean_gap_vs_competitor_client_minus_competitor"])[:6]  # most negative first
+    top_beh = sorted(eval_comp, key=lambda r: r["mean_gap_vs_competitor_client_minus_competitor"])[:6]
 
     priority = []
     seen = set()
@@ -534,7 +489,6 @@ def to_xlsx_bytes(rows):
     return out.getvalue()
 
 def build_pdf(ctx, parsed):
-    """Create a simple PDF report in the OptiCoder spirit (cover + sections)."""
     if not pdf_supported:
         return None
 
@@ -555,7 +509,6 @@ def build_pdf(ctx, parsed):
     )
     elems = []
 
-    # Cover
     elems.append(Paragraph("GapCoder – GAP Analysis Summary", h1))
     elems.append(Spacer(1, 4 * mm))
     meta = (
@@ -575,7 +528,6 @@ def build_pdf(ctx, parsed):
     elems.append(Paragraph(defs, normal))
     elems.append(PageBreak())
 
-    # Total
     total = parsed.get("total_gap_overview", {})
     elems.append(Paragraph("Total GAP overview", heading))
     elems.append(Spacer(1, 2 * mm))
@@ -587,7 +539,6 @@ def build_pdf(ctx, parsed):
         elems.append(Paragraph(narrative.replace("\n", "<br/>"), normal))
     elems.append(PageBreak())
 
-    # Sections
     secs = parsed.get("sections", []) or []
     for s in secs:
         sec_name = s.get("section", "Unnamed section")
@@ -607,7 +558,7 @@ def build_pdf(ctx, parsed):
 
 
 # --------------------
-# Claude: tool-based structured output
+# Claude: tool schemas
 # --------------------
 TOOL_SCHEMA = {
     "name": "gap_analysis",
@@ -641,6 +592,74 @@ TOOL_SCHEMA = {
     }
 }
 
+SECTION_TOOL = {
+    "name": "gap_section",
+    "description": "Return ONE section summary in strict structured format.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "section": {"type": "string"},
+            "slide_bullets": {"type": "array", "items": {"type": "string"}},
+            "narrative": {"type": "string"}
+        },
+        "required": ["section", "slide_bullets", "narrative"]
+    }
+}
+
+def _block_get(block, key, default=None):
+    if isinstance(block, dict):
+        return block.get(key, default)
+    return getattr(block, key, default)
+
+def extract_tool_output(msg, tool_name: str):
+    content = getattr(msg, "content", None)
+    if not content:
+        return None
+    for block in content:
+        if _block_get(block, "type") == "tool_use" and _block_get(block, "name") == tool_name:
+            return _block_get(block, "input")
+    return None
+
+def extract_text(msg):
+    out = []
+    content = getattr(msg, "content", None) or []
+    for block in content:
+        if _block_get(block, "type") == "text":
+            out.append(_block_get(block, "text", ""))
+    return "\n".join([t for t in out if t]).strip()
+
+def call_claude(prompt: str, client: Anthropic):
+    msg = client.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=MAX_CLAUDE_TOKENS,
+        temperature=0.2,
+        messages=[{"role": "user", "content": prompt}],
+        tools=[TOOL_SCHEMA],
+        tool_choice={"type": "tool", "name": "gap_analysis"},
+    )
+    parsed = extract_tool_output(msg, tool_name="gap_analysis")
+    return parsed, msg
+
+def call_claude_one_section(prompt: str, client: Anthropic):
+    msg = client.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=2200,
+        temperature=0.2,
+        messages=[{"role": "user", "content": prompt}],
+        tools=[SECTION_TOOL],
+        tool_choice={"type": "tool", "name": "gap_section"},
+    )
+    parsed = extract_tool_output(msg, tool_name="gap_section")
+    return parsed, msg
+
+def sections_by_name(sections_list):
+    out = {}
+    for s in sections_list or []:
+        name = (s.get("section") or "").strip()
+        if name:
+            out[name] = s
+    return out
+
 def build_prompt(ctx, overall_stats, section_stats, criterion_table_small, section_names_to_return, comment_samples):
     return f"""
 You are a senior market research consultant. Write a GAP analysis summary that is slide-ready and grounded ONLY in the provided statistics and comment samples.
@@ -663,9 +682,8 @@ SECTIONS TO RETURN (exact names):
 
 RULES:
 - Do NOT invent numbers.
-- Use the provided overall/section stats and criterion table.
-- Missing handling: 0, 999 and blanks are excluded. Gaps are computed pairwise (both values must exist).
 - Be explicit when referring to a gap: always state whether it is Gap vs Expectations (Importance - Client) or Gap vs Competitor (Client - Competitor).
+- Missing handling: 0, 999 and blanks are excluded. Gaps are computed pairwise (both values must exist).
 
 PROJECT CONTEXT:
 - Project: {ctx.get("project_no","")}
@@ -682,57 +700,60 @@ SECTION STATS:
 CRITERION TABLE (means & mean gaps):
 {json.dumps(criterion_table_small, ensure_ascii=False, indent=2)}
 
-COMMENT SAMPLES (use for improvement suggestions; refer to section/criterion when possible):
+COMMENT SAMPLES:
 {json.dumps(comment_samples, ensure_ascii=False, indent=2)}
 
 WHAT TO PRODUCE (as tool output):
 1) Total GAP overview (200–400 words narrative + slide bullets)
-   Include:
-   - how many criteria evaluated
-   - high-level remark
-   - competitive advantages / similar / behind (where evaluable, based on Gap vs Competitor)
-   - top 3 competitive advantages (Gap vs Competitor = Client - Competitor) and weakest positions (smallest/negative Gap vs Competitor)
-   - largest gaps vs expectations (Gap vs Expectations = Importance - Client)
-   - key improvement themes based on comment samples
 2) Key findings per section (200–300 words each + slide bullets)
-   Cover:
-   - expectations met in general (Gap vs Expectations = Importance - Client)
-   - top gaps vs expectations (Importance - Client)
-   - performance vs competition (Client - Competitor)
-   - weakest positions vs competition
-   - improvement suggestions based on comment samples
 """.strip()
 
-def extract_tool_output(msg, tool_name="gap_analysis"):
-    """Return the tool input dict if present, else None."""
-    content = getattr(msg, "content", None)
-    if not content:
-        return None
-    for block in content:
-        btype = getattr(block, "type", None)
-        name = getattr(block, "name", None)
-        if btype == "tool_use" and name == tool_name:
-            return getattr(block, "input", None)
-    return None
+def build_one_section_prompt(ctx, section_name, section_stat, section_rows, comment_samples_for_section):
+    return f"""
+You are a senior market research consultant. Produce a slide-ready summary for ONE section only.
 
-def call_claude(prompt: str, client: Anthropic):
-    msg = client.messages.create(
-        model=CLAUDE_MODEL,
-        max_tokens=MAX_CLAUDE_TOKENS,
-        temperature=0.2,
-        messages=[{"role": "user", "content": prompt}],
-        tools=[TOOL_SCHEMA],
-        tool_choice={"type": "tool", "name": "gap_analysis"},
-    )
-    parsed = extract_tool_output(msg, tool_name="gap_analysis")
-    return parsed, msg
+SECTION (exact): {section_name}
 
-def sections_by_name(sections_list):
+DEFINITIONS (use these labels consistently):
+- Gap vs Expectations = (Importance - Client). Positive means: under-delivery vs what matters.
+- Gap vs Competitor = (Client - Competitor). Positive means: client leads competitor.
+
+COMPETITIVE POSITION BUCKETS (based on Gap vs Competitor):
+- Competitive advantages if > +0.30
+- Similar to competition if between -0.30 and +0.30
+- Behind competition if < -0.30
+
+RULES:
+- Do NOT invent numbers.
+- Be explicit about which gap you reference.
+- Missing: 0/999/blanks excluded; gaps are pairwise.
+
+PROJECT CONTEXT:
+- Project: {ctx.get("project_no","")}
+- Client: {ctx.get("client_name","")}
+- Industry: {ctx.get("industry","")}
+- Objectives: {ctx.get("objectives","")}
+
+SECTION STATS:
+{json.dumps(section_stat, ensure_ascii=False, indent=2)}
+
+SECTION CRITERIA (means & mean gaps):
+{json.dumps(section_rows, ensure_ascii=False, indent=2)}
+
+SECTION COMMENT SAMPLES (if any):
+{json.dumps(comment_samples_for_section, ensure_ascii=False, indent=2)}
+
+OUTPUT:
+- slide_bullets: 5–8 bullets (PPT-friendly)
+- narrative: 200–300 words
+""".strip()
+
+def filter_comment_samples_for_section(section_name, criterion_rows, comment_samples):
+    gap_nos_in_section = {r["gap_no"] for r in criterion_rows}
     out = {}
-    for s in sections_list or []:
-        name = (s.get("section") or "").strip()
-        if name:
-            out[name] = s
+    for gap_no, items in (comment_samples or {}).items():
+        if gap_no in gap_nos_in_section:
+            out[gap_no] = items
     return out
 
 
@@ -740,10 +761,15 @@ def sections_by_name(sections_list):
 # Streamlit UI
 # --------------------
 st.set_page_config(page_title="GapCoder", layout="wide")
-st.markdown(f"# 📊 GapCoder (v1.6.1)\n_Last updated: {datetime.now():%Y-%m-%d}_")
+st.markdown(f"# 📊 GapCoder (v1.6.2)\n_Last updated: {datetime.now():%Y-%m-%d}_")
 
 projects = load_projects(PROJECTS_FILE)
 client = Anthropic(api_key=st.secrets.get("ANTHROPIC_API_KEY", ""))
+
+# Session outputs (for downloads)
+for k in ["gapcoder_parsed", "gapcoder_criteria", "gapcoder_ctx"]:
+    if k not in st.session_state:
+        st.session_state[k] = None
 
 with st.expander("1. Project Context", expanded=True):
     sel = st.selectbox("Load project:", ["-- New --"] + list(projects.keys()))
@@ -774,16 +800,22 @@ with st.expander("1. Project Context", expanded=True):
         "gap_dict_raw": gap_dict_raw
     }
 
-    if project_no:
-        projects[project_no] = ctx
-        save_projects(PROJECTS_FILE, projects)
-
     gd = parse_gap_dictionary(gap_dict_raw)
     if gd:
         secs = sorted({v["section"] for v in gd.values()})
         st.info(f"✅ Gap Dictionary loaded: {len(gd)} gaps mapped across {len(secs)} sections.")
     else:
         st.warning("Gap Dictionary is required before running the analysis.")
+
+    selected_section = None
+    if mode == "One section" and gd:
+        secs = sorted({v["section"] for v in gd.values()})
+        selected_section = st.selectbox("Choose section to analyse", secs, index=0)
+
+    if project_no:
+        ctx["selected_section"] = selected_section
+        projects[project_no] = ctx
+        save_projects(PROJECTS_FILE, projects)
 
 with st.expander("2. Input data (simple)", expanded=True):
     st.markdown(
@@ -811,13 +843,6 @@ with st.expander("2. Input data (simple)", expanded=True):
         )
         raw_text = st.text_area("Paste table here", height=260, key="raw_gap")
 
-# Session outputs (for downloads)
-if "gapcoder_parsed" not in st.session_state:
-    st.session_state["gapcoder_parsed"] = None
-if "gapcoder_criteria" not in st.session_state:
-    st.session_state["gapcoder_criteria"] = None
-if "gapcoder_ctx" not in st.session_state:
-    st.session_state["gapcoder_ctx"] = None
 
 if st.button("🧠 Generate GAP Analysis"):
     if not st.secrets.get("ANTHROPIC_API_KEY"):
@@ -854,7 +879,6 @@ if st.button("🧠 Generate GAP Analysis"):
         st.error("Could not find any gap columns. Expected headers like gap_imp_1 / gap_perf_1 / gap_comp_1 / gap_comm_1.")
         st.stop()
 
-    # Ensure dictionary covers all gaps found
     missing_in_dict = [n for n in gaps if n not in gap_dict]
     if missing_in_dict:
         st.error(f"Gap Dictionary is missing these gap numbers: {missing_in_dict}. Please add them.")
@@ -866,9 +890,11 @@ if st.button("🧠 Generate GAP Analysis"):
 
     # Filter for one section (optional)
     if ctx.get("mode") == "One section":
-        all_sections = sorted({gap_dict[n]["section"] for n in gaps})
-        selected_section = st.selectbox("Choose section to analyse", all_sections, index=0)
-        gaps = [n for n in gaps if gap_dict[n]["section"] == selected_section]
+        sec = ctx.get("selected_section")
+        if not sec:
+            st.error("Please select a section in Project Context.")
+            st.stop()
+        gaps = [n for n in gaps if gap_dict[n]["section"] == sec]
         if not gaps:
             st.error("No gaps found for selected section.")
             st.stop()
@@ -882,7 +908,7 @@ if st.button("🧠 Generate GAP Analysis"):
         gap_dict=gap_dict
     )
 
-    # Build slim criterion payload for Claude (keep it readable but not huge)
+    # Build slim criterion payload for Claude
     criterion_small = []
     for r in criterion_table:
         criterion_small.append({
@@ -904,7 +930,6 @@ if st.button("🧠 Generate GAP Analysis"):
     for r in criterion_small:
         grouped.setdefault(r["section"], []).append(r)
     section_stats = {sec: summarise(items) for sec, items in grouped.items()}
-
     section_names = sorted(list(section_stats.keys()))
 
     comment_samples = pick_comment_samples(criterion_small, comments_by_gap, max_gaps=12, per_gap=6)
@@ -915,22 +940,14 @@ if st.button("🧠 Generate GAP Analysis"):
     st.markdown("### Criterion table (means & gaps)")
     st.dataframe(criterion_small, use_container_width=True)
 
-    # First call
+    # First call (big prompt)
     prompt = build_prompt(ctx, overall_stats, section_stats, criterion_small, section_names, comment_samples)
     with st.spinner("🤖 Claude is thinking…"):
         parsed, msg = call_claude(prompt, client)
 
     if not isinstance(parsed, dict):
         st.error("Claude did not return the structured tool output. Showing raw output below.")
-        raw_text_out = ""
-        try:
-            content = getattr(msg, "content", [])
-            for b in content:
-                if getattr(b, "type", "") == "text":
-                    raw_text_out += getattr(b, "text", "") + "\n"
-        except Exception:
-            pass
-        st.text_area("Raw output", raw_text_out or "(no text returned)", height=320)
+        st.text_area("Raw output", extract_text(msg) or "(no text returned)", height=320)
         st.stop()
 
     # Repair pass if sections missing / empty / incomplete
@@ -940,8 +957,7 @@ if st.button("🧠 Generate GAP Analysis"):
 
     if len(sections_out) == 0 or missing:
         st.warning(
-            "Claude returned no (or incomplete) section outputs. "
-            "Running a one-time repair call focused on sections…"
+            "Claude returned no (or incomplete) section outputs. Running a one-time repair call focused on sections…"
         )
 
         section_detail = {sec: grouped.get(sec, []) for sec in section_names}
@@ -980,18 +996,44 @@ Produce:
             parsed2, msg2 = call_claude(repair_prompt, client)
 
         if isinstance(parsed2, dict) and (parsed2.get("sections") or []):
-            parsed["sections"] = parsed2.get("sections", parsed["sections"])
-        else:
-            st.error("Repair attempt failed. Showing raw output below.")
-            raw_text_out = ""
-            try:
-                content = getattr(msg2, "content", [])
-                for b in content:
-                    if getattr(b, "type", "") == "text":
-                        raw_text_out += getattr(b, "text", "") + "\n"
-            except Exception:
-                pass
-            st.text_area("Raw output (repair)", raw_text_out or "(no text returned)", height=320)
+            parsed["sections"] = parsed2.get("sections", parsed.get("sections", []))
+
+    # FINAL BACKSTOP: if still no sections, do one Claude call per section
+    sections_out = parsed.get("sections", []) or []
+    sec_map = sections_by_name(sections_out)
+    missing_after = [s for s in section_names if s not in sec_map]
+
+    if len(sections_out) == 0 or missing_after:
+        st.warning(
+            "Sections are still missing after repair. "
+            "Generating section outputs reliably by calling Claude once per section…"
+        )
+
+        rebuilt_sections = []
+        for sec in section_names:
+            sec_rows = grouped.get(sec, [])
+            sec_stat = section_stats.get(sec, {})
+            sec_comments = filter_comment_samples_for_section(sec, sec_rows, comment_samples)
+
+            one_prompt = build_one_section_prompt(ctx, sec, sec_stat, sec_rows, sec_comments)
+            with st.spinner(f"🧩 Building section: {sec}"):
+                one_parsed, one_msg = call_claude_one_section(one_prompt, client)
+
+            if isinstance(one_parsed, dict) and one_parsed.get("section") and one_parsed.get("slide_bullets") is not None:
+                one_parsed["section"] = sec  # enforce exact naming
+                rebuilt_sections.append(one_parsed)
+            else:
+                # ultra-safe fallback: minimal structured text so the UI never ends up empty
+                rebuilt_sections.append({
+                    "section": sec,
+                    "slide_bullets": [
+                        "Section output could not be generated automatically.",
+                        "Please re-run, or check that section statistics are present."
+                    ],
+                    "narrative": "No section narrative was generated in this run."
+                })
+
+        parsed["sections"] = rebuilt_sections
 
     # Store for downloads
     st.session_state["gapcoder_parsed"] = parsed
