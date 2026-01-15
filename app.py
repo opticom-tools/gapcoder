@@ -1016,4 +1016,3 @@ for k, v in ctx.items():
         st.sidebar.markdown(f"**{k.replace('_',' ').title()}:** (configured)")
     else:
         st.sidebar.markdown(f"**{k.replace('_',' ').title()}:** {v}")
-```
