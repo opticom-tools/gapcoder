@@ -1,9 +1,9 @@
 # -------------------------------------------------------------
-# GapCoder v1.5 — GAP Analysis Summariser (Importance / Client / Competitor + Comments)
+# GapCoder v1.6 — GAP Analysis Summariser (Importance / Client / Competitor + Comments)
 # Last updated: 2026-01-15
 #
 # Supported headers (ONLY; no fallback):
-#   gap_imp_1, gap_perf_1, gap_comp_1, gap_comm_1
+#   gap_imp_1, gap_perf_1, gap_comp_1, gap_comm_1 (and so on)
 #
 # Input:
 # - Upload .xlsx (recommended when comments are long / may contain line breaks)
@@ -25,12 +25,13 @@
 # - Means of gaps are averages of those respondent-level gaps (NOT gap-of-means).
 #
 # Competitive position buckets (based on Gap vs Competitor = Client - Competitor):
-# - "competitive advantages" if > +0.30
-# - "behind competition" if < -0.30
-# - "similar to competition" otherwise
+# - "Competitive advantages" if > +0.30
+# - "Behind competition" if < -0.30
+# - "Similar to competition" otherwise
 #
 # Claude output reliability:
-# - Uses Anthropic tool calling to force structured output (prevents invalid JSON).
+# - Uses Anthropic tool calling to force structured output.
+# - If sections are missing/empty, runs ONE repair call focused on sections.
 # -------------------------------------------------------------
 
 import streamlit as st
@@ -55,7 +56,6 @@ try:
     from reportlab.lib.units import mm
     from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak
     from reportlab.lib.styles import getSampleStyleSheet
-    from reportlab.lib import colors
     pdf_supported = True
 except Exception:
     pdf_supported = False
@@ -65,7 +65,7 @@ except Exception:
 # Config
 # --------------------
 CLAUDE_MODEL = "claude-sonnet-4-5"
-MAX_CLAUDE_TOKENS = 2600
+MAX_CLAUDE_TOKENS = 4200  # increased: section narratives can be long
 PROJECTS_FILE = "gapcoder_projects.json"
 
 # threshold for competitive position buckets (Client - Competitor)
@@ -329,10 +329,10 @@ def classify_competitive_position(gap_client_minus_competitor):
     if gap_client_minus_competitor is None:
         return None
     if gap_client_minus_competitor > COMP_TOL:
-        return "competitive_advantages"
+        return "Competitive advantages"
     if gap_client_minus_competitor < -COMP_TOL:
-        return "behind_competition"
-    return "similar_to_competition"
+        return "Behind competition"
+    return "Similar to competition"
 
 def compute_tables(rows, gaps, col_map, resp_id_col, gap_dict):
     """
@@ -405,8 +405,8 @@ def compute_tables(rows, gaps, col_map, resp_id_col, gap_dict):
             "mean_competitor": None if comp_mean is None else round(comp_mean, 2),
 
             # Means of respondent-level gaps
-            "mean_gap_vs_expectations_imp_minus_perf": None if gap_expect_mean is None else round(gap_expect_mean, 2),
-            "mean_gap_vs_competitor_perf_minus_comp": None if gap_comp_mean is None else round(gap_comp_mean, 2),
+            "mean_gap_vs_expectations_importance_minus_client": None if gap_expect_mean is None else round(gap_expect_mean, 2),
+            "mean_gap_vs_competitor_client_minus_competitor": None if gap_comp_mean is None else round(gap_comp_mean, 2),
 
             # Counts (useful for reliability)
             "n_importance": sum(1 for v in imp_vals if v is not None),
@@ -420,63 +420,58 @@ def compute_tables(rows, gaps, col_map, resp_id_col, gap_dict):
 
 def summarise(criteria_rows):
     total = len(criteria_rows)
-    eval_comp = [r for r in criteria_rows if r["mean_gap_vs_competitor_perf_minus_comp"] is not None]
-    eval_expect = [r for r in criteria_rows if r["mean_gap_vs_expectations_imp_minus_perf"] is not None]
+    eval_comp = [r for r in criteria_rows if r["mean_gap_vs_competitor_client_minus_competitor"] is not None]
+    eval_expect = [r for r in criteria_rows if r["mean_gap_vs_expectations_importance_minus_client"] is not None]
 
-    adv = sim = beh = 0
+    pos_counts = {"Competitive advantages": 0, "Similar to competition": 0, "Behind competition": 0}
     for r in eval_comp:
-        cls = classify_competitive_position(r["mean_gap_vs_competitor_perf_minus_comp"])
-        if cls == "competitive_advantages":
-            adv += 1
-        elif cls == "behind_competition":
-            beh += 1
-        else:
-            sim += 1
+        cls = classify_competitive_position(r["mean_gap_vs_competitor_client_minus_competitor"])
+        if cls:
+            pos_counts[cls] += 1
 
-    # Top lists
-    top_adv = sorted(eval_comp, key=lambda r: r["mean_gap_vs_competitor_perf_minus_comp"], reverse=True)[:3]
-    top_beh = sorted(eval_comp, key=lambda r: r["mean_gap_vs_competitor_perf_minus_comp"])[:3]
-    top_expect = sorted(eval_expect, key=lambda r: r["mean_gap_vs_expectations_imp_minus_perf"], reverse=True)[:3]
+    top_adv = sorted(eval_comp, key=lambda r: r["mean_gap_vs_competitor_client_minus_competitor"], reverse=True)[:3]
+    top_beh = sorted(eval_comp, key=lambda r: r["mean_gap_vs_competitor_client_minus_competitor"])[:3]
+    top_expect = sorted(eval_expect, key=lambda r: r["mean_gap_vs_expectations_importance_minus_client"], reverse=True)[:3]
 
     avg_imp = mean([r["mean_importance"] for r in criteria_rows])
     avg_cli = mean([r["mean_client"] for r in criteria_rows])
     avg_com = mean([r["mean_competitor"] for r in criteria_rows])
-    avg_gap_comp = mean([r["mean_gap_vs_competitor_perf_minus_comp"] for r in eval_comp])
-    avg_gap_expect = mean([r["mean_gap_vs_expectations_imp_minus_perf"] for r in eval_expect])
+    avg_gap_comp = mean([r["mean_gap_vs_competitor_client_minus_competitor"] for r in eval_comp])
+    avg_gap_expect = mean([r["mean_gap_vs_expectations_importance_minus_client"] for r in eval_expect])
 
     return {
         "criteria_total": total,
         "criteria_evaluable_vs_competitor": len(eval_comp),
         "criteria_evaluable_vs_expectations": len(eval_expect),
 
-        "competitive_position_counts_based_on_client_minus_competitor": {
-            "competitive_advantages": adv,
-            "similar_to_competition": sim,
-            "behind_competition": beh,
+        "competitive_position_counts_based_on_gap_vs_competitor_client_minus_competitor": {
+            "Competitive advantages": pos_counts["Competitive advantages"],
+            "Similar to competition": pos_counts["Similar to competition"],
+            "Behind competition": pos_counts["Behind competition"],
             "threshold": COMP_TOL
         },
 
         "averages": {
-            "importance": None if avg_imp is None else round(avg_imp, 2),
-            "client": None if avg_cli is None else round(avg_cli, 2),
-            "competitor": None if avg_com is None else round(avg_com, 2),
-            "gap_vs_competitor_client_minus_competitor": None if avg_gap_comp is None else round(avg_gap_comp, 2),
-            "gap_vs_expectations_importance_minus_client": None if avg_gap_expect is None else round(avg_gap_expect, 2)
+            "importance_mean": None if avg_imp is None else round(avg_imp, 2),
+            "client_mean": None if avg_cli is None else round(avg_cli, 2),
+            "competitor_mean": None if avg_com is None else round(avg_com, 2),
+            "gap_vs_competitor_client_minus_competitor_mean": None if avg_gap_comp is None else round(avg_gap_comp, 2),
+            "gap_vs_expectations_importance_minus_client_mean": None if avg_gap_expect is None else round(avg_gap_expect, 2)
         },
 
-        "top3_competitive_advantages_client_minus_competitor": [
+        "top3_competitive_advantages_gap_vs_competitor_client_minus_competitor": [
             {"gap_no": r["gap_no"], "section": r["section"], "criterion": r["criterion"],
-             "gap_client_minus_competitor": r["mean_gap_vs_competitor_perf_minus_comp"]}
+             "gap_vs_competitor_client_minus_competitor": r["mean_gap_vs_competitor_client_minus_competitor"]}
             for r in top_adv
         ],
-        "top3_behind_competition_client_minus_competitor": [
+        "top3_behind_competition_gap_vs_competitor_client_minus_competitor": [
             {"gap_no": r["gap_no"], "section": r["section"], "criterion": r["criterion"],
-             "gap_client_minus_competitor": r["mean_gap_vs_competitor_perf_minus_comp"]}
+             "gap_vs_competitor_client_minus_competitor": r["mean_gap_vs_competitor_client_minus_competitor"]}
             for r in top_beh
         ],
         "top3_gaps_vs_expectations_importance_minus_client": [
             {"gap_no": r["gap_no"], "section": r["section"], "criterion": r["criterion"],
-             "gap_importance_minus_client": r["mean_gap_vs_expectations_imp_minus_perf"]}
+             "gap_vs_expectations_importance_minus_client": r["mean_gap_vs_expectations_importance_minus_client"]}
             for r in top_expect
         ],
 
@@ -485,11 +480,11 @@ def summarise(criteria_rows):
 
 def pick_comment_samples(criteria_table, comments_by_gap, max_gaps=12, per_gap=6):
     """Keep prompt small: focus on biggest expectation gaps and most negative competitor gaps."""
-    eval_expect = [r for r in criteria_table if r["mean_gap_vs_expectations_imp_minus_perf"] is not None]
-    eval_comp = [r for r in criteria_table if r["mean_gap_vs_competitor_perf_minus_comp"] is not None]
+    eval_expect = [r for r in criteria_table if r["mean_gap_vs_expectations_importance_minus_client"] is not None]
+    eval_comp = [r for r in criteria_table if r["mean_gap_vs_competitor_client_minus_competitor"] is not None]
 
-    top_expect = sorted(eval_expect, key=lambda r: r["mean_gap_vs_expectations_imp_minus_perf"], reverse=True)[:6]
-    top_beh = sorted(eval_comp, key=lambda r: r["mean_gap_vs_competitor_perf_minus_comp"])[:6]  # most negative first
+    top_expect = sorted(eval_expect, key=lambda r: r["mean_gap_vs_expectations_importance_minus_client"], reverse=True)[:6]
+    top_beh = sorted(eval_comp, key=lambda r: r["mean_gap_vs_competitor_client_minus_competitor"])[:6]  # most negative first
 
     priority = []
     seen = set()
@@ -531,7 +526,7 @@ def to_xlsx_bytes(rows):
     out.seek(0)
     return out.getvalue()
 
-def build_pdf(ctx, parsed, criteria_rows_slim=None):
+def build_pdf(ctx, parsed):
     """Create a simple PDF report in the OptiCoder spirit (cover + sections)."""
     if not pdf_supported:
         return None
@@ -577,13 +572,11 @@ def build_pdf(ctx, parsed, criteria_rows_slim=None):
     total = parsed.get("total_gap_overview", {})
     elems.append(Paragraph("Total GAP overview", heading))
     elems.append(Spacer(1, 2 * mm))
-    bullets = total.get("slide_bullets", []) or []
-    if bullets:
-        for b in bullets:
-            elems.append(Paragraph(f"• {str(b)}", normal))
-        elems.append(Spacer(1, 4 * mm))
-    narrative = total.get("narrative", "") or ""
-    if narrative.strip():
+    for b in (total.get("slide_bullets", []) or []):
+        elems.append(Paragraph(f"• {str(b)}", normal))
+    elems.append(Spacer(1, 4 * mm))
+    narrative = (total.get("narrative", "") or "").strip()
+    if narrative:
         elems.append(Paragraph(narrative.replace("\n", "<br/>"), normal))
     elems.append(PageBreak())
 
@@ -596,17 +589,10 @@ def build_pdf(ctx, parsed, criteria_rows_slim=None):
         for b in (s.get("slide_bullets", []) or []):
             elems.append(Paragraph(f"• {str(b)}", normal))
         elems.append(Spacer(1, 4 * mm))
-        nar = s.get("narrative", "") or ""
-        if nar.strip():
+        nar = (s.get("narrative", "") or "").strip()
+        if nar:
             elems.append(Paragraph(nar.replace("\n", "<br/>"), normal))
         elems.append(PageBreak())
-
-    # Optional: small appendix note
-    if criteria_rows_slim:
-        elems.append(Paragraph("Appendix (excerpt): Criterion table", heading))
-        elems.append(Spacer(1, 2 * mm))
-        note = "Full criterion table is available as a downloadable file from the app."
-        elems.append(Paragraph(note, normal))
 
     doc.build(elems)
     buf.seek(0)
@@ -632,6 +618,7 @@ TOOL_SCHEMA = {
             },
             "sections": {
                 "type": "array",
+                "minItems": 1,  # IMPORTANT: prevent empty sections
                 "items": {
                     "type": "object",
                     "properties": {
@@ -647,7 +634,7 @@ TOOL_SCHEMA = {
     }
 }
 
-def build_prompt(ctx, criteria_for_prompt, overall_stats, section_stats, comment_samples):
+def build_prompt(ctx, overall_stats, section_stats, criterion_table_small, section_names_to_return, comment_samples):
     return f"""
 You are a senior market research consultant. Write a GAP analysis summary that is slide-ready and grounded ONLY in the provided statistics and comment samples.
 
@@ -656,9 +643,16 @@ DEFINITIONS (use these labels consistently):
 - Gap vs Competitor = (Client - Competitor). Positive means: client leads competitor.
 
 COMPETITIVE POSITION BUCKETS (based on Gap vs Competitor = Client - Competitor):
-- "Competitive advantages" if > +0.30
-- "Similar to competition" if between -0.30 and +0.30
-- "Behind competition" if < -0.30
+- Competitive advantages if > +0.30
+- Similar to competition if between -0.30 and +0.30
+- Behind competition if < -0.30
+
+CRITICAL OUTPUT RULE:
+You MUST return section outputs for EVERY section listed below.
+Return EXACTLY {len(section_names_to_return)} section objects, one per section name, and use the section names EXACTLY as provided (no renaming).
+
+SECTIONS TO RETURN (exact names):
+{json.dumps(section_names_to_return, ensure_ascii=False)}
 
 RULES:
 - Do NOT invent numbers.
@@ -678,8 +672,8 @@ OVERALL STATS:
 SECTION STATS:
 {json.dumps(section_stats, ensure_ascii=False, indent=2)}
 
-CRITERION TABLE:
-{json.dumps(criteria_for_prompt, ensure_ascii=False, indent=2)}
+CRITERION TABLE (means & gap means):
+{json.dumps(criterion_table_small, ensure_ascii=False, indent=2)}
 
 COMMENT SAMPLES (use for improvement suggestions; refer to section/criterion when possible):
 {json.dumps(comment_samples, ensure_ascii=False, indent=2)}
@@ -690,12 +684,12 @@ WHAT TO PRODUCE (as tool output):
    - how many criteria evaluated
    - high-level remark
    - competitive advantages / similar / behind (where evaluable, based on Gap vs Competitor)
-   - top 3 competitive advantages (Client - Competitor) and weakest positions (smallest/negative Client - Competitor)
-   - largest gaps vs expectations (Importance - Client)
+   - top 3 competitive advantages (Gap vs Competitor = Client - Competitor) and weakest positions (smallest/negative Gap vs Competitor)
+   - largest gaps vs expectations (Gap vs Expectations = Importance - Client)
    - key improvement themes based on comment samples
 2) Key findings per section (200–300 words each + slide bullets)
    Cover:
-   - expectations met in general (Importance vs Client)
+   - expectations met in general (Gap vs Expectations = Importance - Client)
    - top gaps vs expectations (Importance - Client)
    - performance vs competition (Client - Competitor)
    - weakest positions vs competition
@@ -714,12 +708,32 @@ def extract_tool_output(msg, tool_name="gap_analysis"):
             return getattr(block, "input", None)
     return None
 
+def call_claude(prompt: str, client: Anthropic):
+    msg = client.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=MAX_CLAUDE_TOKENS,
+        temperature=0.2,
+        messages=[{"role": "user", "content": prompt}],
+        tools=[TOOL_SCHEMA],
+        tool_choice={"type": "tool", "name": "gap_analysis"},
+    )
+    parsed = extract_tool_output(msg, tool_name="gap_analysis")
+    return parsed, msg
+
+def sections_by_name(sections_list):
+    out = {}
+    for s in sections_list or []:
+        name = (s.get("section") or "").strip()
+        if name:
+            out[name] = s
+    return out
+
 
 # --------------------
 # Streamlit UI
 # --------------------
 st.set_page_config(page_title="GapCoder", layout="wide")
-st.markdown(f"# 📊 GapCoder (v1.5)\n_Last updated: {datetime.now():%Y-%m-%d}_")
+st.markdown(f"# 📊 GapCoder (v1.6)\n_Last updated: {datetime.now():%Y-%m-%d}_")
 
 projects = load_projects(PROJECTS_FILE)
 client = Anthropic(api_key=st.secrets.get("ANTHROPIC_API_KEY", ""))
@@ -844,7 +858,6 @@ if st.button("🧠 Generate GAP Analysis"):
         st.warning("No RESP_ID/ID column detected. Rows will be labelled as RESP_001, RESP_002, ...")
 
     # Filter for one section (optional)
-    selected_section = None
     if ctx.get("mode") == "One section":
         all_sections = sorted({gap_dict[n]["section"] for n in gaps})
         selected_section = st.selectbox("Choose section to analyse", all_sections, index=0)
@@ -862,57 +875,46 @@ if st.button("🧠 Generate GAP Analysis"):
         gap_dict=gap_dict
     )
 
-    overall_stats = summarise(criterion_table)
-
-    grouped = {}
+    # Build slim criterion payload for Claude (keep it readable but not huge)
+    criterion_small = []
     for r in criterion_table:
-        grouped.setdefault(r["section"], []).append(r)
-    section_stats = {sec: summarise(items) for sec, items in grouped.items()}
-
-    comment_samples = pick_comment_samples(criterion_table, comments_by_gap, max_gaps=12, per_gap=6)
-
-    # Reduce table for Claude (smaller + explicit gap names)
-    criteria_for_prompt = []
-    for r in criterion_table:
-        criteria_for_prompt.append({
+        criterion_small.append({
             "gap_no": r["gap_no"],
             "section": r["section"],
             "criterion": r["criterion"],
-
             "mean_importance": r["mean_importance"],
             "mean_client": r["mean_client"],
             "mean_competitor": r["mean_competitor"],
-
-            "mean_gap_vs_expectations_importance_minus_client": r["mean_gap_vs_expectations_imp_minus_perf"],
-            "mean_gap_vs_competitor_client_minus_competitor": r["mean_gap_vs_competitor_perf_minus_comp"],
-
+            "gap_vs_expectations_importance_minus_client": r["mean_gap_vs_expectations_importance_minus_client"],
+            "gap_vs_competitor_client_minus_competitor": r["mean_gap_vs_competitor_client_minus_competitor"],
             "n_gap_vs_expectations": r["n_gap_vs_expectations"],
             "n_gap_vs_competitor": r["n_gap_vs_competitor"],
         })
+
+    overall_stats = summarise(criterion_small)
+
+    grouped = {}
+    for r in criterion_small:
+        grouped.setdefault(r["section"], []).append(r)
+    section_stats = {sec: summarise(items) for sec, items in grouped.items()}
+
+    section_names = sorted(list(section_stats.keys()))
+
+    comment_samples = pick_comment_samples(criterion_small, comments_by_gap, max_gaps=12, per_gap=6)
 
     st.subheader("Quick sanity check (computed from your data)")
     st.write(overall_stats)
 
     st.markdown("### Criterion table (means & gaps)")
-    st.dataframe(criteria_for_prompt, use_container_width=True)
+    st.dataframe(criterion_small, use_container_width=True)
 
-    prompt = build_prompt(ctx, criteria_for_prompt, overall_stats, section_stats, comment_samples)
-
+    # First call
+    prompt = build_prompt(ctx, overall_stats, section_stats, criterion_small, section_names, comment_samples)
     with st.spinner("🤖 Claude is thinking…"):
-        msg = client.messages.create(
-            model=CLAUDE_MODEL,
-            max_tokens=MAX_CLAUDE_TOKENS,
-            temperature=0.2,
-            messages=[{"role": "user", "content": prompt}],
-            tools=[TOOL_SCHEMA],
-            tool_choice={"type": "tool", "name": "gap_analysis"},
-        )
-
-    parsed = extract_tool_output(msg, tool_name="gap_analysis")
+        parsed, msg = call_claude(prompt, client)
 
     if not isinstance(parsed, dict):
         st.error("Claude did not return the structured tool output. Showing raw output below.")
-        # Best-effort raw text display:
         raw_text_out = ""
         try:
             content = getattr(msg, "content", [])
@@ -924,10 +926,73 @@ if st.button("🧠 Generate GAP Analysis"):
         st.text_area("Raw output", raw_text_out or "(no text returned)", height=320)
         st.stop()
 
+    # Repair pass if sections missing / empty / incomplete
+    sections_out = parsed.get("sections", []) or []
+    sec_map = sections_by_name(sections_out)
+    missing = [s for s in section_names if s not in sec_map]
+
+    if len(sections_out) == 0 or missing:
+        st.warning(
+            "Claude returned no (or incomplete) section outputs. "
+            "Running a one-time repair call focused on sections…"
+        )
+
+        # Create a smaller payload: by-section criteria lists only (keeps repair prompt smaller)
+        section_detail = {sec: grouped.get(sec, []) for sec in section_names}
+
+        repair_prompt = f"""
+You must output section summaries for EVERY section name listed below.
+Return EXACTLY {len(section_names)} section objects, one per section name, with names exactly matching.
+
+Definitions:
+- Gap vs Expectations = (Importance - Client)
+- Gap vs Competitor = (Client - Competitor)
+
+Competitive buckets based on Gap vs Competitor:
+- Competitive advantages if > +0.30
+- Similar to competition if between -0.30 and +0.30
+- Behind competition if < -0.30
+
+SECTION NAMES (exact):
+{json.dumps(section_names, ensure_ascii=False)}
+
+SECTION STATS:
+{json.dumps(section_stats, ensure_ascii=False, indent=2)}
+
+SECTION DETAIL TABLE (per section):
+{json.dumps(section_detail, ensure_ascii=False, indent=2)}
+
+COMMENT SAMPLES:
+{json.dumps(comment_samples, ensure_ascii=False, indent=2)}
+
+Produce:
+- total_gap_overview can be short (bullets + brief narrative),
+- but sections MUST be complete: 200–300 words narrative + slide bullets for each section.
+""".strip()
+
+        with st.spinner("🔧 Repairing section outputs…"):
+            parsed2, msg2 = call_claude(repair_prompt, client)
+
+        if isinstance(parsed2, dict) and (parsed2.get("sections") or []):
+            # Keep original total overview if it exists; replace sections with repaired ones
+            parsed["sections"] = parsed2.get("sections", parsed["sections"])
+        else:
+            st.error("Repair attempt failed. Showing raw output below.")
+            raw_text_out = ""
+            try:
+                content = getattr(msg2, "content", [])
+                for b in content:
+                    if getattr(b, "type", "") == "text":
+                        raw_text_out += getattr(b, "text", "") + "\n"
+            except Exception:
+                pass
+            st.text_area("Raw output (repair)", raw_text_out or "(no text returned)", height=320)
+
     # Store for downloads
     st.session_state["gapcoder_parsed"] = parsed
-    st.session_state["gapcoder_criteria"] = criteria_for_prompt
+    st.session_state["gapcoder_criteria"] = criterion_small
     st.session_state["gapcoder_ctx"] = ctx
+
 
 # --------------------
 # Display outputs + downloads (if available)
@@ -982,7 +1047,7 @@ if parsed and criteria_for_prompt and ctx_saved:
 
         st.markdown("### Download PDF report")
         if pdf_supported:
-            pdf_bytes = build_pdf(ctx_saved, parsed, criteria_rows_slim=criteria_for_prompt)
+            pdf_bytes = build_pdf(ctx_saved, parsed)
             st.download_button(
                 "⬇️ Download PDF",
                 data=pdf_bytes,
@@ -1011,8 +1076,9 @@ if parsed and criteria_for_prompt and ctx_saved:
 
 # Sidebar context
 st.sidebar.header("Project Context")
-for k, v in ctx.items():
-    if k.endswith("_raw"):
-        st.sidebar.markdown(f"**{k.replace('_',' ').title()}:** (configured)")
-    else:
-        st.sidebar.markdown(f"**{k.replace('_',' ').title()}:** {v}")
+if 'ctx' in locals():
+    for k, v in ctx.items():
+        if k.endswith("_raw"):
+            st.sidebar.markdown(f"**{k.replace('_',' ').title()}:** (configured)")
+        else:
+            st.sidebar.markdown(f"**{k.replace('_',' ').title()}:** {v}")
